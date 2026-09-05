@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""ccauth - switch between multiple Claude Code accounts without re-running /login.
+
+Claude Code keeps one set of credentials at a time. On macOS they live in the
+login Keychain; on Linux they live in a file inside the config directory. The
+account identity is stored separately, in the oauthAccount field of the global
+config file. ccauth saves both halves together as a named profile and writes
+them back as a pair.
+
+Repository: https://github.com/qzkinhit/ccauth
+License: MIT
+"""
+
+import hashlib
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+VERSION = "1.0.0"
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+RESERVED = {"save", "use", "list", "ls", "status", "current", "rm", "remove",
+            "help", "version", "path"}
+
+# Account-scoped caches in the global config. They describe the previous
+# account's subscription and model entitlements, so they must be dropped on
+# switch. Claude Code refetches them on the next start.
+STALE_KEYS = [
+    "hasAvailableSubscription", "subscriptionNoticeCount",
+    "cachedExtraUsageDisabledReason", "metricsStatusCache",
+    "passesEligibilityCache", "modelAccessCache", "orgModelDefaultCache",
+    "additionalModelOptionsCache", "additionalModelCostsCache",
+    "additionalModelOptionsAnsweredAt", "cachedUsageUtilization",
+    "clientDataCacheSlots", "groveConfigCache",
+]
+
+
+# --------------------------------------------------------------------------
+# localisation
+# --------------------------------------------------------------------------
+
+MSG = {
+    "en": {
+        "saved": "Saved account {name} -> {email}",
+        "switched": "Switched to account {name} -> {email}",
+        "restashed": "(stashed the live credentials back into {name})",
+        "removed": "Removed account {name}",
+        "no_profiles": "No accounts saved yet. Start with: ccauth save <name>",
+        "not_found": "No account named {name}. Saved accounts: {have}",
+        "none_saved": "(none)",
+        "no_creds": "No credentials found. Run /login inside claude first.",
+        "not_logged_in": "Not logged in to any account.",
+        "current": "Current account: {email}  [{name}]",
+        "unsaved": "(not saved as a profile)",
+        "plan": "  Plan: {plan}",
+        "expired": "  Access token expired; it will be renewed from the refresh token.",
+        "expires_in": "  Access token valid for another {hours:.1f} h",
+        "running": ("  Note: claude is still running. Existing sessions keep the old "
+                    "account and may overwrite the config on exit. Quit them and "
+                    "start claude again."),
+        "saved_at": "saved {ts}",
+        "bad_name": "Invalid profile name {name!r}. Allowed: letters, digits, . _ -",
+        "reserved": "{name!r} is a reserved word, pick another profile name.",
+        "needs_arg": "{cmd} needs one account name",
+        "kc_verify": "Keychain write did not verify. Is the login keychain unlocked?",
+        "kc_quote": "Credential blob contains a single quote; refusing to write.",
+        "cfg_parse": "Cannot parse {path}: {err}",
+        "exists": "Account {name} already exists ({email}). Pass --force to overwrite.",
+        "usage": """ccauth {version} - switch between Claude Code accounts
+
+Usage:
+  ccauth save <name> [--force]   save the currently logged-in account
+  ccauth use <name>              switch to that account (short form: ccauth <name>)
+  ccauth list                    list saved accounts, * marks the current one
+  ccauth status                  show the current account
+  ccauth rm <name>               delete a saved account
+  ccauth path                    show where credentials and profiles live
+  ccauth version                 print the version
+
+First run:
+  1. ccauth save work            save the account you are logged in as
+  2. claude, then /login         log in as the other account
+  3. ccauth save personal
+  From then on: ccauth work / ccauth personal, then restart claude.
+
+Set CCAUTH_LANG=zh for Chinese output.""",
+        "path_report": """Config directory:   {cfgdir}
+Global config:      {cfgfile}
+Credential store:   {store}
+Profile directory:  {profiles}""",
+    },
+    "zh": {
+        "saved": "已保存账号 {name} -> {email}",
+        "switched": "已切换到账号 {name} -> {email}",
+        "restashed": "（已把当前登录态回存到 {name}）",
+        "removed": "已删除账号 {name}",
+        "no_profiles": "还没有保存任何账号。先运行 ccauth save <名字>",
+        "not_found": "没有名为 {name} 的账号。已保存的有 {have}",
+        "none_saved": "（无）",
+        "no_creds": "没有找到凭据，请先在 claude 里运行 /login",
+        "not_logged_in": "当前未登录任何账号",
+        "current": "当前账号 {email}  [{name}]",
+        "unsaved": "（未保存为 profile）",
+        "plan": "  订阅类型 {plan}",
+        "expired": "  access token 已过期，会自动用 refresh token 续期",
+        "expires_in": "  access token 还剩 {hours:.1f} 小时",
+        "running": ("  注意，claude 仍在运行。已开的会话继续用旧账号，退出时可能覆写配置文件。"
+                    "请全部退出后重新启动 claude。"),
+        "saved_at": "保存于 {ts}",
+        "bad_name": "非法的 profile 名 {name!r}，只允许字母、数字和 . _ -",
+        "reserved": "{name!r} 是保留字，请换一个 profile 名",
+        "needs_arg": "{cmd} 需要一个账号名",
+        "kc_verify": "写入钥匙串后校验不一致，请确认登录钥匙串已解锁",
+        "kc_quote": "凭据内容含单引号，拒绝写入",
+        "cfg_parse": "无法解析 {path}，{err}",
+        "exists": "账号 {name} 已存在（{email}），加 --force 覆盖",
+        "usage": """ccauth {version} - Claude Code 多账号切换
+
+用法
+  ccauth save <名字> [--force]   把当前登录的账号存成一个 profile
+  ccauth use <名字>              切换到该账号（简写 ccauth <名字>）
+  ccauth list                    列出已保存的账号，* 标记当前
+  ccauth status                  显示当前账号
+  ccauth rm <名字>               删除一个 profile
+  ccauth path                    显示凭据与 profile 的存放位置
+  ccauth version                 打印版本号
+
+首次配置
+  1. ccauth save work            保存现在登录的账号
+  2. 启动 claude，运行 /login    登录另一个账号
+  3. ccauth save personal
+  之后 ccauth work / ccauth personal 即可切换，切完重启 claude 生效。
+
+设置 CCAUTH_LANG=en 可切成英文输出。""",
+        "path_report": """配置目录     {cfgdir}
+全局配置文件 {cfgfile}
+凭据存放     {store}
+profile 目录 {profiles}""",
+    },
+}
+
+
+def pick_lang():
+    forced = os.environ.get("CCAUTH_LANG", "").lower()
+    if forced.startswith("zh"):
+        return "zh"
+    if forced.startswith("en"):
+        return "en"
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        if "zh" in os.environ.get(var, "").lower():
+            return "zh"
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.run(["defaults", "read", "-g", "AppleLocale"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            if "zh" in out.lower():
+                return "zh"
+        except Exception:
+            pass
+    return "en"
+
+
+LANG = pick_lang()
+
+
+def t(key, **kw):
+    return MSG[LANG][key].format(**kw)
+
+
+def die(key, **kw):
+    print(f"ccauth: {t(key, **kw)}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --------------------------------------------------------------------------
+# where Claude Code keeps things
+# --------------------------------------------------------------------------
+
+HOME = os.path.expanduser("~")
+IS_MAC = platform.system() == "Darwin"
+STORE = os.environ.get("CCAUTH_HOME") or os.path.join(HOME, ".ccauth")
+
+
+def config_dir():
+    """Mirrors the CLI: CLAUDE_CONFIG_DIR, else ~/.claude."""
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (d if d else os.path.join(HOME, ".claude"))
+
+
+def config_file():
+    """Mirrors the CLI: join(CLAUDE_CONFIG_DIR or homedir, '.claude.json')."""
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return os.path.join(d if d else HOME, ".claude.json")
+
+
+def keychain_service():
+    """Mirrors the CLI's service-name derivation.
+
+    The suffix is empty when neither CLAUDE_SECURESTORAGE_CONFIG_DIR nor
+    CLAUDE_CONFIG_DIR is set; otherwise it is the first 8 hex digits of the
+    sha256 of the resolved directory. This keeps ccauth working when a caller
+    isolates accounts by config directory.
+    """
+    secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if secure is not None:
+        plain = not secure
+        resolved = secure or os.path.join(HOME, ".claude")
+    else:
+        plain = "CLAUDE_CONFIG_DIR" not in os.environ
+        resolved = config_dir()
+    if plain:
+        return "Claude Code-credentials"
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:8]
+    return f"Claude Code-credentials-{digest}"
+
+
+def keychain_account():
+    user = os.environ.get("USER") or "claude-code-user"
+    return user if NAME_RE.match(user) else "claude-code-user"
+
+
+def creds_file():
+    return os.path.join(config_dir(), ".credentials.json")
+
+
+def store_label():
+    if IS_MAC:
+        return f'macOS Keychain, service "{keychain_service()}"'
+    return creds_file()
+
+
+# --------------------------------------------------------------------------
+# credential backends
+# --------------------------------------------------------------------------
+
+def cred_read():
+    if IS_MAC:
+        p = subprocess.run(
+            ["security", "find-generic-password", "-s", keychain_service(),
+             "-a", keychain_account(), "-w"],
+            capture_output=True, text=True)
+        blob = p.stdout.strip()
+        return blob if p.returncode == 0 and blob else None
+    try:
+        with open(creds_file()) as f:
+            blob = f.read().strip()
+        return blob or None
+    except OSError:
+        return None
+
+
+def cred_write(blob):
+    if IS_MAC:
+        # Passed on stdin so the token never appears in the process argv.
+        if "'" in blob:
+            die("kc_quote")
+        cmd = (f'add-generic-password -U -A -s "{keychain_service()}" '
+               f'-a "{keychain_account()}" -w \'{blob}\'\n')
+        subprocess.run(["security", "-i"], input=cmd,
+                       capture_output=True, text=True)
+        if cred_read() != blob:
+            die("kc_verify")
+        return
+    path = creds_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".ccauth-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(blob)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# global config
+# --------------------------------------------------------------------------
+
+def cfg_load():
+    path = config_file()
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        die("cfg_parse", path=path, err=e)
+
+
+def cfg_save(data):
+    path = config_file()
+    os.makedirs(STORE, exist_ok=True)
+    if os.path.exists(path):
+        bak = os.path.join(STORE, "claude.json.bak")
+        fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(path) as src, os.fdopen(fd, "w") as dst:
+            dst.write(src.read())
+    tmp = path + ".ccauth-tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def cur_email():
+    return (cfg_load().get("oauthAccount") or {}).get("emailAddress")
+
+
+# --------------------------------------------------------------------------
+# profiles
+# --------------------------------------------------------------------------
+
+def prof_path(name):
+    if not NAME_RE.match(name):
+        die("bad_name", name=name)
+    if name in RESERVED:
+        die("reserved", name=name)
+    return os.path.join(STORE, name + ".json")
+
+
+def prof_names():
+    if not os.path.isdir(STORE):
+        return []
+    return sorted(f[:-5] for f in os.listdir(STORE)
+                  if f.endswith(".json") and not f.startswith("claude.json"))
+
+
+def prof_read(name):
+    try:
+        with open(prof_path(name)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        have = "、".join(prof_names()) if prof_names() else t("none_saved")
+        die("not_found", name=name, have=have)
+
+
+def prof_write(name, cred, oauth):
+    os.makedirs(STORE, exist_ok=True)
+    os.chmod(STORE, 0o700)
+    data = {
+        "label": name,
+        "email": (oauth or {}).get("emailAddress"),
+        "savedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "credentials": cred,
+        "oauthAccount": oauth,
+    }
+    path = prof_path(name)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+    return data
+
+
+def expiry_note(cred):
+    try:
+        ms = json.loads(cred)["claudeAiOauth"]["expiresAt"]
+    except Exception:
+        return None
+    left = (ms / 1000.0 - time.time()) / 3600.0
+    return t("expired") if left <= 0 else t("expires_in", hours=left)
+
+
+def claude_running():
+    try:
+        p = subprocess.run(["pgrep", "-f", "claude/versions"],
+                           capture_output=True, text=True, timeout=5)
+        return bool(p.stdout.strip())
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_save(name, force=False):
+    if os.path.exists(prof_path(name)) and not force:
+        old = prof_read(name)
+        die("exists", name=name, email=old.get("email"))
+    cred = cred_read()
+    if not cred:
+        die("no_creds")
+    d = prof_write(name, cred, cfg_load().get("oauthAccount"))
+    print(t("saved", name=name, email=d["email"]))
+
+
+def cmd_use(name):
+    target = prof_read(name)
+    live = cred_read()
+    here = cur_email()
+
+    # Before switching away, refresh the outgoing profile from the live
+    # credentials. The access token rotates roughly every 8 hours, so a stale
+    # profile would otherwise carry an expired pair.
+    if live and here and here != target.get("email"):
+        for other in prof_names():
+            if other == name:
+                continue
+            with open(prof_path(other)) as f:
+                if json.load(f).get("email") == here:
+                    prof_write(other, live, cfg_load().get("oauthAccount"))
+                    print(t("restashed", name=other))
+                    break
+
+    cred_write(target["credentials"])
+    cfg = cfg_load()
+    if target.get("oauthAccount"):
+        cfg["oauthAccount"] = target["oauthAccount"]
+    for k in STALE_KEYS:
+        cfg.pop(k, None)
+    cfg_save(cfg)
+
+    print(t("switched", name=name, email=target.get("email")))
+    note = expiry_note(target["credentials"])
+    if note:
+        print(note)
+    if claude_running():
+        print(t("running"))
+
+
+def cmd_list():
+    names = prof_names()
+    if not names:
+        print(t("no_profiles"))
+        return
+    here = cur_email()
+    for n in names:
+        with open(prof_path(n)) as f:
+            d = json.load(f)
+        mark = "*" if d.get("email") == here else " "
+        print(f"{mark} {n:<12} {d.get('email'):<34} {t('saved_at', ts=d.get('savedAt'))}")
+
+
+def cmd_status():
+    oauth = cfg_load().get("oauthAccount") or {}
+    if not oauth:
+        print(t("not_logged_in"))
+        return
+    email = oauth.get("emailAddress")
+    name = t("unsaved")
+    for n in prof_names():
+        with open(prof_path(n)) as f:
+            if json.load(f).get("email") == email:
+                name = n
+                break
+    print(t("current", email=email, name=name))
+    if oauth.get("organizationType"):
+        print(t("plan", plan=oauth["organizationType"]))
+    cred = cred_read()
+    if cred:
+        note = expiry_note(cred)
+        if note:
+            print(note)
+
+
+def cmd_rm(name):
+    prof_read(name)
+    os.remove(prof_path(name))
+    print(t("removed", name=name))
+
+
+def cmd_path():
+    print(t("path_report", cfgdir=config_dir(), cfgfile=config_file(),
+            store=store_label(), profiles=STORE))
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        cmd_status()
+        return
+    cmd, rest = argv[0], argv[1:]
+    force = "--force" in rest or "-f" in rest
+    rest = [a for a in rest if a not in ("--force", "-f")]
+
+    if cmd == "save":
+        if len(rest) != 1:
+            die("needs_arg", cmd=cmd)
+        cmd_save(rest[0], force)
+    elif cmd == "use":
+        if len(rest) != 1:
+            die("needs_arg", cmd=cmd)
+        cmd_use(rest[0])
+    elif cmd in ("rm", "remove"):
+        if len(rest) != 1:
+            die("needs_arg", cmd=cmd)
+        cmd_rm(rest[0])
+    elif cmd in ("list", "ls"):
+        cmd_list()
+    elif cmd in ("status", "current"):
+        cmd_status()
+    elif cmd == "path":
+        cmd_path()
+    elif cmd in ("version", "--version", "-V"):
+        print(f"ccauth {VERSION}")
+    elif cmd in ("help", "--help", "-h"):
+        print(t("usage", version=VERSION))
+    elif NAME_RE.match(cmd) and not rest:
+        cmd_use(cmd)
+    else:
+        print(t("usage", version=VERSION))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
