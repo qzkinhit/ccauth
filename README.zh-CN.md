@@ -94,7 +94,7 @@ Claude Code 把账号信息放在两个地方。
 
 ```json
 {"claudeAiOauth": {"accessToken": "...", "refreshToken": "...",
-  "expiresAt": 1788637711000, "refreshTokenExpiresAt": 1820145511000,
+  "expiresAt": 1788637711000, "refreshTokenExpiresAt": 1791229711000,
   "scopes": ["user:inference", "user:profile"],
   "subscriptionType": "pro", "rateLimitTier": "default_claude_ai"}}
 ```
@@ -103,7 +103,7 @@ Claude Code 把账号信息放在两个地方。
 
 有三个实现细节值得知道。
 
-1. **切走之前会刷新旧 profile。** access token 大约每 8 小时轮换一次。切换前 `ccauth` 会把当前这份活凭据写回它所属的 profile，所以几周没用过的 profile 里仍然是可用的 refresh token。refresh token 的有效期远长于 access token，因此旧 profile 通常能自行续期，不需要重新登录。
+1. **切走之前会刷新旧 profile。** access token 大约每 8 小时轮换一次。切换前 `ccauth` 会把当前这份活凭据写回它所属的 profile，所以几周没用过的 profile 里仍然是可用的 refresh token。refresh token 的有效期大约 30 天，所以一个月内切回去的 profile 能自行续期，不需要重新登录。
 2. **token 不会出现在 `argv` 里。** macOS 上写钥匙串通过 `security -i` 的标准输入完成，`ps` 看不到 token。
 3. **每次写配置文件前都会备份**，备份路径是 `~/.ccauth/claude.json.bak`。
 
@@ -154,7 +154,7 @@ macOS 钥匙串条目用 `security add-generic-password -A` 写入，含义是�
 
 **切换成功了但 `claude` 里还是旧账号。** 切换时有 `claude` 进程在运行，它退出时把旧身份写了回去。退出全部会话，重新执行 `ccauth use <名字>`，再启动 `claude`。
 
-**切换后 `claude` 要求重新登录。** 该 profile 的 refresh token 已过期，长期不用会出现这种情况。对那个账号执行 `/login`，然后用 `ccauth save <名字> --force` 覆盖已存的凭据。
+**切换后 `claude` 要求重新登录。** 该 profile 的 refresh token 已过期，大约一个月没用过那个账号就会出现这种情况。对那个账号执行 `/login`，然后用 `ccauth save <名字> --force` 覆盖已存的凭据。
 
 ## 兼容性
 

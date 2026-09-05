@@ -94,7 +94,7 @@ The credential blob is a small JSON object.
 
 ```json
 {"claudeAiOauth": {"accessToken": "...", "refreshToken": "...",
-  "expiresAt": 1788637711000, "refreshTokenExpiresAt": 1820145511000,
+  "expiresAt": 1788637711000, "refreshTokenExpiresAt": 1791229711000,
   "scopes": ["user:inference", "user:profile"],
   "subscriptionType": "pro", "rateLimitTier": "default_claude_ai"}}
 ```
@@ -103,7 +103,7 @@ The credential blob is a small JSON object.
 
 Three details worth knowing.
 
-1. **Profiles are refreshed on the way out.** The access token rotates roughly every 8 hours. Before switching away, `ccauth` writes the live credentials back into the profile they belong to, so a profile you have not touched for weeks still has a usable refresh token. Refresh tokens are valid far longer than access tokens, so an old profile normally renews itself rather than forcing a new login.
+1. **Profiles are refreshed on the way out.** The access token rotates roughly every 8 hours. Before switching away, `ccauth` writes the live credentials back into the profile they belong to, so a profile you have not touched for weeks still has a usable refresh token. The refresh token lasts about 30 days, so a profile you switch to within a month renews itself instead of forcing a new login.
 2. **Tokens never reach `argv`.** On macOS the Keychain write goes through `security -i` on stdin, so the token is not visible to `ps`.
 3. **The config file is backed up before every write**, to `~/.ccauth/claude.json.bak`.
 
@@ -154,7 +154,7 @@ Do not put `~/.ccauth` in a synced folder, a backup that leaves the machine, or 
 
 **Switched, but `claude` still shows the old account** — a `claude` process was running and wrote the old identity back. Quit every session, run `ccauth use <name>` again, then start `claude`.
 
-**`claude` asks you to log in after a switch** — that profile's refresh token expired, which happens after long disuse. Run `/login` for that account and `ccauth save <name> --force` to replace the stored pair.
+**`claude` asks you to log in after a switch** — that profile's refresh token expired, which happens after roughly a month without using that account. Run `/login` for that account and `ccauth save <name> --force` to replace the stored pair.
 
 ## Compatibility
 
