@@ -128,6 +128,31 @@ done
 
 `ccauth` 在这种目录下也能工作。带上同样的 `CLAUDE_CONFIG_DIR` 运行，它会指向那个目录对应的凭据存储。
 
+## Gemini CLI
+
+`ccauth` 同样支持为 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 切换多个 Google 账号，只需加上 `gemini` 子命令（原有的 Claude Code 命令和逻辑完全不变）：
+
+```sh
+ccauth gemini save work            # 保存当前登录的 Gemini 账号
+# 在 gemini 里切换账号（运行 /auth 登录）后：
+ccauth gemini save personal
+
+ccauth gemini work                 # 一键切回 work
+ccauth gemini list                 # 列出已保存的 Gemini 账号
+ccauth gemini status               # 显示当前 Gemini 账号
+ccauth gemini rm personal          # 删除一个 Gemini profile
+ccauth gemini path                 # 显示 Gemini 凭据与 profile 路径
+```
+
+Gemini 的 profile 单独保存在 `~/.ccauth/gemini/<名字>.json`（权限 `600`），和 Claude Code 的 profile 互不冲突，可以用相同的名字（比如 `work`、`personal`）。脚本会自动处理 `~/.gemini/oauth_creds.json`、`~/.gemini/google_accounts.json` 以及 macOS 钥匙串条目（`gemini-cli-oauth` / `main-account`），并在切走前自动回存当前活跃凭据。
+
+如果想要更短的命令，可以建一个 `gauth` 软链接：
+
+```sh
+ln -s ~/.local/bin/ccauth ~/.local/bin/gauth
+gauth work
+```
+
 ## 文件位置
 
 | 路径 | 内容 |

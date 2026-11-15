@@ -128,6 +128,31 @@ done
 
 `ccauth` works inside such a directory as well. Run it with the same `CLAUDE_CONFIG_DIR` set and it will target that directory's credential store.
 
+## Gemini CLI
+
+`ccauth` also supports switching Google accounts for [Gemini CLI](https://github.com/google-gemini/gemini-cli) using the `gemini` subcommand (all Claude Code commands above remain unchanged):
+
+```sh
+ccauth gemini save work            # save current Gemini account
+# switch account inside gemini (/auth), then:
+ccauth gemini save personal
+
+ccauth gemini work                 # switch back to work
+ccauth gemini list                 # list saved Gemini accounts
+ccauth gemini status               # show current Gemini account
+ccauth gemini rm personal          # delete a saved Gemini profile
+ccauth gemini path                 # show Gemini credential & profile paths
+```
+
+Gemini profiles are stored separately in `~/.ccauth/gemini/<name>.json` (mode `600`), so profile names like `work` and `personal` do not conflict with your Claude Code profiles. Both `~/.gemini/oauth_creds.json` + `~/.gemini/google_accounts.json` and the macOS Keychain entry (`gemini-cli-oauth` / `main-account`) are handled automatically, with outgoing credentials restashed before switching.
+
+If you prefer a shorter command, you can symlink `gauth` to `ccauth`:
+
+```sh
+ln -s ~/.local/bin/ccauth ~/.local/bin/gauth
+gauth work
+```
+
 ## Files
 
 | Path | Contents |
