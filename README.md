@@ -202,6 +202,16 @@ With `hint` on, the bridge asks the model to put independent tool calls into one
 
 The history carries thought signatures from both models. If the relay rejects a request over a signature, the bridge replaces the signatures with the skip value documented for Gemini and retries once. countTokens requests are estimated locally and not sent to the relay.
 
+### Several keys with automatic fallback
+
+```sh
+ccauth agy fallback relay relay2     # use relay2 when relay's key runs out or expires
+ccauth agy fallback relay2 relay     # and the other way round
+ccauth agy fallback relay off        # turn off
+```
+
+When the relay rejects a request because the key's quota or balance is used up, or the key has expired or is invalid, the bridge resends the same request with the fallback key and marks the used-up key until local midnight. While marked, requests start with the fallback key, so no request is spent on the used-up one. The mark clears at midnight, which suits relays that refill quota daily. An upstream pool outage (errors mentioning cooling down or no available channel) does not trigger a switch, since another key on the same relay fails the same way. Manual switching stays `ccauth agy use <name>`.
+
 Third-party mode is implemented for macOS only.
 
 ## Files

@@ -1424,6 +1424,62 @@ def agy_patch_signatures(contents):
     return changed
 
 
+AGY_KEY_ERRORS = ("额度", "余额", "quota", "insufficient", "invalid token", "invalid api key",
+                  "无效的令牌", "令牌", "已过期", "已用尽", "expired", "exhausted", "balance")
+AGY_POOL_ERRORS = ("cooling down", "credentials for model", "no available channel", "无可用渠道")
+
+
+def agy_key_exhausted(code, raw):
+    """The relay rejected this key (quota used up, expired, invalid), not a shared upstream outage."""
+    if code not in (401, 402, 403, 429):
+        return False
+    low = (raw or b"").decode("utf-8", "replace").lower()
+    if any(w in low for w in AGY_POOL_ERRORS):
+        return False
+    return any(w in low for w in AGY_KEY_ERRORS)
+
+
+def agy_next_midnight():
+    now = datetime.now().astimezone()
+    tomorrow = (now + __import__("datetime").timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return tomorrow.isoformat(timespec="seconds")
+
+
+def agy_exhausted(name):
+    until = (agy_state().get("exhausted") or {}).get(name)
+    if not until:
+        return False
+    try:
+        return datetime.fromisoformat(until) > datetime.now().astimezone()
+    except ValueError:
+        return False
+
+
+def agy_mark_exhausted(name, on):
+    st = agy_state()
+    ex = dict(st.get("exhausted") or {})
+    if on:
+        ex[name] = agy_next_midnight()
+    elif name in ex:
+        ex.pop(name)
+    else:
+        return
+    st["exhausted"] = ex
+    agy_state_save(st)
+
+
+def agy_chain(prov):
+    """The active provider followed by its fallbacks; providers used up today go last."""
+    seen, chain, cur = set(), [], prov
+    while cur and cur.get("name") not in seen:
+        seen.add(cur.get("name"))
+        chain.append(cur)
+        nxt = cur.get("fallback")
+        cur = _read_json(os.path.join(agy_provider_dir(), nxt + ".json")) if nxt else None
+    fresh = [c for c in chain if not agy_exhausted(c.get("name"))]
+    return fresh + [c for c in chain if c not in fresh]
+
+
 # ---- the bridge ------------------------------------------------------------
 
 def agy_bridge():
@@ -1622,17 +1678,32 @@ def agy_bridge():
                 agy_add_hint(payload, AGY_HINT if hint is True else hint)
                 kind += " +hint"
             log("relay", op, asked, "->", model, kind)
-            r = self.relay(prov, model, op, payload, stream)
-            if code_of(r) == 400:
+            chain = agy_chain(prov)
+            for i, cand in enumerate(chain):
+                cm = model
+                if cand is not prov and cand.get("models") and model not in cand["models"]:
+                    cm = agy_map_model(model, cand["models"], cand.get("default") or cand["models"][0])
+                r = self.relay(cand, cm, op, payload, stream)
+                if code_of(r) == 400:
+                    raw = r.read()
+                    if b"signature" in raw.lower() and agy_patch_signatures(payload.get("contents")):
+                        log("relay-retry", "thought signatures replaced")
+                        r = self.relay(cand, cm, op, payload, stream)
+                    else:
+                        log("relay-error", 400, raw[:300])
+                        return self.send(400, raw)
+                if code_of(r) == 200:
+                    if agy_exhausted(cand.get("name")):
+                        agy_mark_exhausted(cand.get("name"), False)
+                    break
                 raw = r.read()
-                if b"signature" in raw.lower() and agy_patch_signatures(payload.get("contents")):
-                    log("relay-retry", "thought signatures replaced")
-                    r = self.relay(prov, model, op, payload, stream)
-                else:
-                    log("relay-error", 400, raw[:300])
-                    return self.send(400, raw)
-            if code_of(r) != 200:
-                raw = r.read()
+                if agy_key_exhausted(code_of(r), raw) and i + 1 < len(chain):
+                    agy_mark_exhausted(cand.get("name"), True)
+                    log("key-exhausted", cand.get("name"), code_of(r), raw[:160],
+                        "-> retry with", chain[i + 1].get("name"))
+                    continue
+                if agy_key_exhausted(code_of(r), raw):
+                    agy_mark_exhausted(cand.get("name"), True)
                 log("relay-error", code_of(r), raw[:300])
                 return self.send(code_of(r), raw)
             if not stream:
@@ -1798,6 +1869,23 @@ def acmd_writing(name, value):
              f"{name} 写作类问题全程用所选模型 {'开' if p['writing'] else '关'}"))
 
 
+def acmd_fallback(name, other):
+    path = agy_provider_path(name)
+    p = agy_provider(name)
+    if other in ("off", "none", ""):
+        p.pop("fallback", None)
+        msg = tt(f"{name}: no fallback key.", f"{name} 已关闭自动换 key")
+    else:
+        agy_provider(other)
+        if other == name:
+            agy_die("A provider cannot fall back to itself.", "不能把自己设为备用")
+        p["fallback"] = other
+        msg = tt(f"{name}: when its key runs out, requests go to {other} until midnight.",
+                 f"{name} 的 key 额度用完或失效时，自动改用 {other}，到当天零点再换回")
+    _write_private(path, json.dumps(p, indent=2))
+    print(msg)
+
+
 def acmd_list():
     act = agy_state().get("active", "official")
     st = agy_state()
@@ -1827,6 +1915,10 @@ def acmd_status():
           (tt(f"running on 127.0.0.1:{AGY_PORT}", f"运行中 127.0.0.1:{AGY_PORT}")
            if agy_bridge_alive() else tt("NOT running", "未运行")))
     print(tt("  Models: ", "  模型 ") + ", ".join(p.get("models") or []))
+    print(tt("  Fallback: ", "  备用 key ") + (p.get("fallback") or tt("none", "无")))
+    ex = {k: v for k, v in (agy_state().get("exhausted") or {}).items() if agy_exhausted(k)}
+    if ex:
+        print(tt("  Used up today: ", "  今日已用完 ") + ", ".join(f"{k}（{tt('until', '到')} {v[11:16]}）" for k, v in ex.items()))
     print(tt("  Request-saving prompt: ", "  省调用提示词 ") +
           (tt("on", "开") if p.get("hint") else tt("off", "关")))
     print(tt("  Writing questions on the chosen model: ", "  写作类问题全程用所选模型 ") +
@@ -1869,6 +1961,8 @@ Usage:
                                     pin writing questions to the chosen model by keyword (default off)
   ccauth agy hint <name> <on|off|text>
                                     append a request-saving note to the system prompt
+  ccauth agy fallback <name> <other|off>
+                                    when the key runs out or expires, switch to another relay until midnight
   ccauth agy save                   save the current Google session (done automatically on first switch)
   ccauth agy list                   list official + saved relays, * marks the active one
   ccauth agy status                 show the active mode
@@ -1891,6 +1985,8 @@ Restart agy and the desktop app after switching.""",
                                     按关键词让写作类问题全程用所选模型（默认关）
   ccauth agy hint <名字> <on|off|文本>
                                     在系统提示末尾追加省调用提示词，也可以给自定义文本
+  ccauth agy fallback <名字> <备用名字|off>
+                                    key 额度用完或失效时自动改用另一个，到当天零点再换回
   ccauth agy save                   保存当前官方登录态（第一次切走时会自动保存）
   ccauth agy list                   列出官方与已保存的中转站，* 标记当前
   ccauth agy status                 显示当前模式
@@ -1946,6 +2042,10 @@ def agy_main(argv):
         if len(rest) != 2:
             die("needs_arg", cmd="agy writing <name> <on|off>")
         acmd_writing(rest[0], rest[1])
+    elif cmd == "fallback":
+        if len(rest) != 2:
+            die("needs_arg", cmd="agy fallback <name> <other|off>")
+        acmd_fallback(rest[0], rest[1])
     elif cmd == "hint":
         if len(rest) != 2:
             die("needs_arg", cmd="agy hint <name> <on|off|text>")

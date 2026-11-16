@@ -202,6 +202,16 @@ ccauth agy hint relay off
 
 两个模型的历史里带有思维签名。中转站因为签名拒绝请求时，本地桥把签名替换为 Gemini 文档给出的跳过校验值后重试一次。countTokens 请求在本地估算，不发给中转站。
 
+### 多个 key 自动切换
+
+```sh
+ccauth agy fallback relay relay2     # relay 的 key 用完或失效时改用 relay2
+ccauth agy fallback relay2 relay     # 反过来也设上，两个 key 互为备用
+ccauth agy fallback relay off        # 关闭
+```
+
+中转站以额度用完、余额不足、key 过期或无效拒绝请求时，本地桥用备用 key 重发同一个请求，并把用完的 key 标记到当天零点。标记期间的请求直接从备用 key 开始，不再先试用完的那个。零点后标记解除，按每天刷新额度的中转站正好恢复。中转站上游号池冷却（报错含 cooling down 或无可用渠道）不触发切换，因为同一站点换 key 也会失败。手动切换仍用 `ccauth agy use <名字>`。
+
 第三方模式目前只支持 macOS。
 
 ## 文件位置
