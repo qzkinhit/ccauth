@@ -1326,6 +1326,74 @@ def agy_rewrite_quota(data):
     return data
 
 
+def agy_is_tool_step(contents):
+    """True when the newest message carries tool results rather than user text."""
+    if not isinstance(contents, list) or not contents:
+        return False
+    last = contents[-1] if isinstance(contents[-1], dict) else {}
+    return any(isinstance(p, dict) and "functionResponse" in p for p in last.get("parts") or [])
+
+
+AGY_HINT = ("Billing note from the user: every model request in this session is billed per call. "
+            "Keep the number of requests low without lowering the quality of the result. "
+            "Issue all independent tool calls together in one turn (read several files at once, "
+            "run independent commands in parallel). When file paths are known, read them directly "
+            "instead of exploring step by step. Do not re-read a file you have just written unless "
+            "the result is uncertain. Answer as soon as you have enough information. Never skip a "
+            "step that is needed for a correct answer.")
+AGY_CHEAP_PREFIX = re.compile(r"(?:^|\n|>)\s*@h(?:\s|$)")
+
+
+def agy_last_user_text(contents):
+    if not isinstance(contents, list) or not contents:
+        return ""
+    last = contents[-1] if isinstance(contents[-1], dict) else {}
+    return "\n".join(p.get("text", "") for p in last.get("parts") or [] if isinstance(p, dict))
+
+
+def agy_wants_cheap(contents):
+    """The user started the question with @h."""
+    for c in reversed(contents or []):
+        if not isinstance(c, dict) or c.get("role") != "user":
+            continue
+        parts = c.get("parts") or []
+        if any(isinstance(p, dict) and "functionResponse" in p for p in parts):
+            continue
+        text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        return bool(AGY_CHEAP_PREFIX.search(text))
+    return False
+
+
+def agy_add_hint(payload, text):
+    si = payload.get("systemInstruction")
+    if not isinstance(si, dict):
+        si = {"parts": []}
+    parts = list(si.get("parts") or [])
+    if not any(isinstance(p, dict) and p.get("text") == text for p in parts):
+        parts.append({"text": text})
+    si["parts"] = parts
+    payload["systemInstruction"] = si
+
+
+AGY_SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+
+def agy_patch_signatures(contents):
+    """Replace thought signatures so another model accepts the history."""
+    changed = False
+    for c in contents or []:
+        if not isinstance(c, dict) or c.get("role") != "model":
+            continue
+        for part in c.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            if "thoughtSignature" in part or "functionCall" in part:
+                if part.get("thoughtSignature") != AGY_SKIP_SIGNATURE:
+                    part["thoughtSignature"] = AGY_SKIP_SIGNATURE
+                    changed = True
+    return changed
+
+
 # ---- the bridge ------------------------------------------------------------
 
 def agy_bridge():
@@ -1401,9 +1469,15 @@ def agy_bridge():
                     return self.cloudcode_gen(prov, op, data)
                 if prov and "/models/" in self.path:
                     return self.gemini_api(prov, data)
+            except (BrokenPipeError, ConnectionResetError):
+                log("client closed", self.path.split("?")[0])
+                return
             except Exception as e:
                 log("error", self.path.split("?")[0], repr(e))
-                return self.error(502, "ccauth bridge: " + str(e))
+                try:
+                    return self.error(502, "ccauth bridge: " + str(e))
+                except (BrokenPipeError, ConnectionResetError):
+                    return
             self.account_call(data)
 
         # Account calls of the desktop app. Served from the local cache in
@@ -1490,47 +1564,61 @@ def agy_bridge():
                 payload.pop(k, None)
             return payload
 
-        def pick(self, prov, asked):
+        def pick(self, prov, asked, payload):
+            """Main model for a fresh user turn, the cheap model for tool-result steps."""
             models = prov.get("models") or []
-            return agy_map_model(asked, models, prov.get("default") or (models[0] if models else asked))
+            model = agy_map_model(asked, models, prov.get("default") or (models[0] if models else asked))
+            cheap = prov.get("cheap")
+            contents = payload.get("contents")
+            step = agy_is_tool_step(contents)
+            kind = "tool-step" if step else "user-turn"
+            if cheap and _family(model) not in ("flash", "flash-lite"):
+                if agy_wants_cheap(contents):
+                    return cheap, kind + " @h"
+                if step:
+                    return cheap, kind
+            return model, kind
 
-        # Desktop app path: Cloud Code envelope -> plain Gemini API.
-        def cloudcode_gen(self, prov, op, data):
-            j = json.loads(data or b"{}")
-            model = self.pick(prov, j.get("model"))
-            inner = self.clean(dict(j.get("request") or {}))
-            log("relay", op, j.get("model"), "->", model)
+        def generate(self, prov, op, asked, payload, stream, wrap):
             if op == "countTokens":
-                r = self.relay(prov, model, "countTokens", {"contents": inner.get("contents", [])}, False)
+                n = len(json.dumps(payload.get("contents", payload))) // 4
+                return self.send(200, json.dumps({"totalTokens": n}).encode())
+            model, kind = self.pick(prov, asked, payload)
+            hint = prov.get("hint")
+            if hint and _family(model) not in ("flash", "flash-lite"):
+                agy_add_hint(payload, AGY_HINT if hint is True else hint)
+                kind += " +hint"
+            log("relay", op, asked, "->", model, kind)
+            r = self.relay(prov, model, op, payload, stream)
+            if code_of(r) == 400:
                 raw = r.read()
-                if code_of(r) != 200:
-                    raw = json.dumps({"totalTokens": len(json.dumps(inner)) // 4}).encode()
-                return self.send(200, raw)
-            stream = op == "streamGenerateContent"
-            r = self.relay(prov, model, op, inner, stream)
+                if b"signature" in raw.lower() and agy_patch_signatures(payload.get("contents")):
+                    log("relay-retry", "thought signatures replaced")
+                    r = self.relay(prov, model, op, payload, stream)
+                else:
+                    log("relay-error", 400, raw[:300])
+                    return self.send(400, raw)
             if code_of(r) != 200:
                 raw = r.read()
                 log("relay-error", code_of(r), raw[:300])
                 return self.send(code_of(r), raw)
             if not stream:
-                return self.send(200, json.dumps({"response": json.loads(r.read())}).encode())
-            self.stream_back(r, True)
+                obj = json.loads(r.read())
+                return self.send(200, json.dumps({"response": obj} if wrap else obj).encode())
+            self.stream_back(r, wrap)
 
-        # agy GEMINI_API_KEY path: only the model name changes.
+        # Desktop app path: Cloud Code envelope -> plain Gemini API.
+        def cloudcode_gen(self, prov, op, data):
+            j = json.loads(data or b"{}")
+            inner = self.clean(dict(j.get("request") or {}))
+            self.generate(prov, op, j.get("model"), inner, op == "streamGenerateContent", True)
+
+        # agy GEMINI_API_KEY path.
         def gemini_api(self, prov, data):
             path = self.path.split("?")[0]
             asked, _, op = path.split("/models/", 1)[1].partition(":")
-            model = self.pick(prov, asked)
-            stream = "alt=sse" in self.path
             payload = self.clean(json.loads(data or b"{}"))
-            log("relay", op, asked, "->", model)
-            r = self.relay(prov, model, op, payload, stream)
-            if code_of(r) != 200 or not stream:
-                raw = r.read()
-                if code_of(r) != 200:
-                    log("relay-error", code_of(r), raw[:300])
-                return self.send(code_of(r), raw)
-            self.stream_back(r, False)
+            self.generate(prov, op, asked, payload, "alt=sse" in self.path, False)
 
     if IS_MAC and active():
         subprocess.run(["launchctl", "setenv", "CLOUD_CODE_URL", f"http://127.0.0.1:{AGY_PORT}"],
@@ -1637,6 +1725,37 @@ def agy_restart_note(hooked):
                  "  Antigravity 桌面版下次启动时生效"))
 
 
+def acmd_cheap(name, model):
+    path = agy_provider_path(name)
+    p = agy_provider(name)
+    if model in ("off", "none", ""):
+        p.pop("cheap", None)
+        msg = tt(f"{name}: every call uses the chosen model.", f"{name} 已关闭混合路由，所有调用都用所选模型")
+    else:
+        if p.get("models") and model not in p["models"]:
+            agy_die(f"{model} is not served by {name}. Available: {', '.join(p['models'])}",
+                    f"{name} 没有 {model}，可用的有 {', '.join(p['models'])}")
+        p["cheap"] = model
+        msg = tt(f"{name}: tool-result steps now use {model}; the first call of each question keeps the chosen model.",
+                 f"{name} 已开启混合路由，每个问题的第一次调用用所选模型，之后带工具结果的调用用 {model}")
+    _write_private(path, json.dumps(p, indent=2))
+    print(msg)
+
+
+def acmd_hint(name, value):
+    path = agy_provider_path(name)
+    p = agy_provider(name)
+    if value in ("off", "none", ""):
+        p.pop("hint", None)
+        msg = tt(f"{name}: no extra system prompt.", f"{name} 已关闭省调用提示词")
+    else:
+        p["hint"] = True if value == "on" else value
+        msg = tt(f"{name}: the bridge appends a request-saving note to the system prompt.",
+                 f"{name} 已开启省调用提示词，本地桥会把它追加到每次请求的系统提示末尾")
+    _write_private(path, json.dumps(p, indent=2))
+    print(msg)
+
+
 def acmd_list():
     act = agy_state().get("active", "official")
     st = agy_state()
@@ -1666,6 +1785,10 @@ def acmd_status():
           (tt(f"running on 127.0.0.1:{AGY_PORT}", f"运行中 127.0.0.1:{AGY_PORT}")
            if agy_bridge_alive() else tt("NOT running", "未运行")))
     print(tt("  Models: ", "  模型 ") + ", ".join(p.get("models") or []))
+    print(tt("  Request-saving prompt: ", "  省调用提示词 ") +
+          (tt("on", "开") if p.get("hint") else tt("off", "关")))
+    print(tt("  Tool-result steps: ", "  工具结果步骤 ") +
+          (p["cheap"] if p.get("cheap") else tt("same model as the question", "与提问相同的模型")))
 
 
 def acmd_rm(name):
@@ -1694,6 +1817,11 @@ Usage:
                                     save a Gemini-compatible relay; models are read from /v1/models
   ccauth agy use <name>             switch agy and the desktop app to that relay
   ccauth agy use official           switch back to the Google sign-in
+  ccauth agy cheap <name> <model|off>
+                                    send tool-result steps to a cheaper model (first call keeps yours);
+                                    a question that starts with @h uses the cheaper model throughout
+  ccauth agy hint <name> <on|off|text>
+                                    append a request-saving note to the system prompt
   ccauth agy save                   save the current Google session (done automatically on first switch)
   ccauth agy list                   list official + saved relays, * marks the active one
   ccauth agy status                 show the active mode
@@ -1708,6 +1836,11 @@ Restart agy and the desktop app after switching.""",
                                     保存一个 Gemini 兼容的中转站，模型列表自动从 /v1/models 读取
   ccauth agy use <名字>             把 agy 和桌面版切到该中转站
   ccauth agy use official           切回官方 Google 登录
+  ccauth agy cheap <名字> <模型|off>
+                                    带工具结果的步骤改用便宜模型，每个问题的第一次调用仍用所选模型
+                                    以 @h 开头的问题从头到尾都用便宜模型
+  ccauth agy hint <名字> <on|off|文本>
+                                    在系统提示末尾追加省调用提示词，也可以给自定义文本
   ccauth agy save                   保存当前官方登录态（第一次切走时会自动保存）
   ccauth agy list                   列出官方与已保存的中转站，* 标记当前
   ccauth agy status                 显示当前模式
@@ -1755,6 +1888,14 @@ def agy_main(argv):
         if len(rest) != 1:
             die("needs_arg", cmd="agy rm")
         acmd_rm(rest[0])
+    elif cmd == "cheap":
+        if len(rest) != 2:
+            die("needs_arg", cmd="agy cheap <name> <model|off>")
+        acmd_cheap(rest[0], rest[1])
+    elif cmd == "hint":
+        if len(rest) != 2:
+            die("needs_arg", cmd="agy hint <name> <on|off|text>")
+        acmd_hint(rest[0], rest[1])
     elif cmd == "save":
         agy_save_session()
     elif cmd in ("list", "ls"):

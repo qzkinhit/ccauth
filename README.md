@@ -185,6 +185,23 @@ The relay receives the conversation, the generation settings and its own key. Th
 
 In third-party mode the app's model list is rewritten. Carbon is unlocked when the relay serves it, quota shows as full, and Claude and GPT models, which the relay does not serve, are hidden.
 
+### Saving requests on a per-call relay
+
+Each tool call of the agent (reading a file, running a command) sends the result back to the model in a new request, so one question usually costs several requests. Two switches help when the relay bills per call.
+
+```sh
+ccauth agy cheap relay gemini-4-hydrogen-xhigh   # tool-result steps use a cheaper model
+ccauth agy hint relay on                         # append a request-saving note to the system prompt
+ccauth agy cheap relay off                       # turn off
+ccauth agy hint relay off
+```
+
+With `cheap` on, the bridge looks at the newest message. When it is your question the chosen model answers, and when it is a tool result the cheaper model answers. The first call of every question, which plans the work, stays on the strong model and the execution steps run on the cheaper one. A question that starts with `@h` uses the cheaper model for every call, which suits simple tasks.
+
+With `hint` on, the bridge asks the model to put independent tool calls into one turn, to read known paths directly and to answer once it has enough information. A custom text can be passed as the third argument instead of `on`.
+
+The history carries thought signatures from both models. If the relay rejects a request over a signature, the bridge replaces the signatures with the skip value documented for Gemini and retries once. countTokens requests are estimated locally and not sent to the relay.
+
 Third-party mode is implemented for macOS only.
 
 ## Files
