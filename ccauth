@@ -2018,25 +2018,29 @@ def agy_quota_of(prov):
     return left_usd, used_units / per_dollar, None
 
 
-def acmd_quota():
-    names = agy_provider_names()
-    if not names:
-        agy_die("No relays saved yet.", "还没有保存任何第三方")
+def agy_quota_lines():
     act = agy_state().get("active")
-    for n in names:
+    out = []
+    for n in agy_provider_names():
         p = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {})
         left, used, err = agy_quota_of(p)
         mark = "*" if n == act else " "
         key = p.get("key") or ""
         tail = "..." + key[-4:] if len(key) > 8 else ""
         if err:
-            print(f"{mark} {n:<12} {tail:<8} " + tt("query failed: ", "查询失败 ") + err)
+            out.append(f"{mark} {n:<12} {tail:<8} " + tt("query failed: ", "查询失败 ") + err)
             continue
-        flag = ""
-        if agy_exhausted(n):
-            flag = tt("  (used up today)", "  （今日已用完）")
-        print(f"{mark} {n:<12} {tail:<8} " + tt("left", "剩余") + f" ${left:,.2f}   "
-              + tt("used", "已用") + f" ${used:,.2f}{flag}")
+        flag = tt("  (used up today)", "  （今日已用完）") if agy_exhausted(n) else ""
+        out.append(f"{mark} {n:<12} {tail:<8} " + tt("left", "剩余") + f" ${left:,.2f}   "
+                   + tt("used", "已用") + f" ${used:,.2f}{flag}")
+    return out
+
+
+def acmd_quota():
+    if not agy_provider_names():
+        agy_die("No relays saved yet.", "还没有保存任何第三方")
+    for line in agy_quota_lines():
+        print(line)
 
 
 def acmd_list():
@@ -2054,12 +2058,22 @@ def acmd_list():
         print(f"{mark} {n:<12} {p.get('url', ''):<34} {tail:<12} {', '.join(p.get('models') or [])}")
 
 
+def agy_status_keys():
+    if not agy_provider_names():
+        return
+    print(tt("Relay keys (balance queried live, no model request):",
+             "第三方 key 与余额（实时查询，不消耗模型调用）"))
+    for line in agy_quota_lines():
+        print("  " + line)
+
+
 def acmd_status():
     act = agy_state().get("active", "official")
     if act == "official":
         print(tt("Antigravity: official Google sign-in", "Antigravity 当前为官方 Google 登录"))
         print(tt("  Session in keychain: ", "  钥匙串登录态 ") + (tt("yes", "有") if agy_kc_read() else tt("no", "无")))
         print(tt("  Saved copy: ", "  保存的副本 ") + (tt("yes", "有") if os.path.exists(agy_session_file()) else tt("no", "无")))
+        agy_status_keys()
         return
     p = _read_json(os.path.join(agy_provider_dir(), act + ".json"), {})
     print(tt(f"Antigravity: third-party {act} ({p.get('url')})",
@@ -2079,6 +2093,7 @@ def acmd_status():
     print(tt("  Writing steps: ", "  写作步骤 ") + (p.get("writer") or tt("same as tool steps", "同工具步骤")))
     print(tt("  Tool-result steps: ", "  工具结果步骤 ") +
           (p["cheap"] if p.get("cheap") else tt("same model as the question", "与提问相同的模型")))
+    agy_status_keys()
 
 
 def acmd_rm(name):
