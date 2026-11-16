@@ -1337,10 +1337,12 @@ def agy_is_tool_step(contents):
 AGY_HINT = ("Billing note from the user: every model request in this session is billed per call. "
             "Keep the number of requests low without lowering the quality of the result. "
             "Issue all independent tool calls together in one turn (read several files at once, "
-            "run independent commands in parallel). When file paths are known, read them directly "
-            "instead of exploring step by step. Do not re-read a file you have just written unless "
-            "the result is uncertain. Answer as soon as you have enough information. Never skip a "
-            "step that is needed for a correct answer.")
+            "run independent searches and commands in parallel). When file paths are known, read "
+            "them directly instead of exploring step by step. Finish all research and reading "
+            "before writing, then write the complete text or edit in a single step instead of "
+            "several partial edits. Do not re-read a file you have just written unless the result "
+            "is uncertain. Answer as soon as you have enough information. Never skip a step that "
+            "is needed for a correct answer.")
 AGY_CHEAP_PREFIX = re.compile(r"(?:^|\n|>)\s*@h(?:\s|$)")
 
 
@@ -1351,8 +1353,19 @@ def agy_last_user_text(contents):
     return "\n".join(p.get("text", "") for p in last.get("parts") or [] if isinstance(p, dict))
 
 
-def agy_wants_cheap(contents):
-    """The user started the question with @h."""
+AGY_MAIN_PREFIX = re.compile(r"(?:^|\n|>)\s*@m(?:\s|$)")
+AGY_WRITING_WORDS = [
+    "写作", "撰写", "写一段", "写一篇", "写段", "润色", "改写", "重写", "扩写", "改稿", "修改稿",
+    "翻译", "论文", "摘要", "引言", "正文", "段落", "措辞", "文案", "表述", "行文", "语句",
+    "去ai", "审稿", "回复审稿", "rebuttal", "cover letter", "读者", "文章", "报告", "邮件",
+    "polish", "rewrite", "rephrase", "paraphrase", "proofread", "translate", "wording",
+    "manuscript", "paper", "abstract", "introduction", "essay", "prose",
+    ".tex", ".docx", ".md",
+]
+
+
+def agy_question(contents):
+    """The user's own words of the newest question, without the app's metadata."""
     for c in reversed(contents or []):
         if not isinstance(c, dict) or c.get("role") != "user":
             continue
@@ -1360,8 +1373,25 @@ def agy_wants_cheap(contents):
         if any(isinstance(p, dict) and "functionResponse" in p for p in parts):
             continue
         text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict))
-        return bool(AGY_CHEAP_PREFIX.search(text))
-    return False
+        m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", text, re.S)
+        return (m.group(1) if m else text).strip()
+    return ""
+
+
+def agy_route_reason(prov, contents):
+    """Why a whole question is pinned to one model: ('cheap'|'main', reason) or (None, '')."""
+    q = agy_question(contents)
+    if AGY_CHEAP_PREFIX.search(q):
+        return "cheap", "@h"
+    if AGY_MAIN_PREFIX.search(q):
+        return "main", "@m"
+    if prov.get("writing", False):
+        low = q.lower()
+        words = prov.get("writing_words") or AGY_WRITING_WORDS
+        for w in words:
+            if w.lower() in low:
+                return "main", "writing:" + w
+    return None, ""
 
 
 def agy_add_hint(payload, text):
@@ -1573,8 +1603,11 @@ def agy_bridge():
             step = agy_is_tool_step(contents)
             kind = "tool-step" if step else "user-turn"
             if cheap and _family(model) not in ("flash", "flash-lite"):
-                if agy_wants_cheap(contents):
-                    return cheap, kind + " @h"
+                pin, why = agy_route_reason(prov, contents)
+                if pin == "cheap":
+                    return cheap, kind + " " + why
+                if pin == "main":
+                    return model, kind + " " + why
                 if step:
                     return cheap, kind
             return model, kind
@@ -1756,6 +1789,15 @@ def acmd_hint(name, value):
     print(msg)
 
 
+def acmd_writing(name, value):
+    path = agy_provider_path(name)
+    p = agy_provider(name)
+    p["writing"] = value != "off"
+    _write_private(path, json.dumps(p, indent=2))
+    print(tt(f"{name}: writing questions keep the chosen model: {'on' if p['writing'] else 'off'}",
+             f"{name} 写作类问题全程用所选模型 {'开' if p['writing'] else '关'}"))
+
+
 def acmd_list():
     act = agy_state().get("active", "official")
     st = agy_state()
@@ -1787,6 +1829,8 @@ def acmd_status():
     print(tt("  Models: ", "  模型 ") + ", ".join(p.get("models") or []))
     print(tt("  Request-saving prompt: ", "  省调用提示词 ") +
           (tt("on", "开") if p.get("hint") else tt("off", "关")))
+    print(tt("  Writing questions on the chosen model: ", "  写作类问题全程用所选模型 ") +
+          (tt("on", "开") if p.get("writing", False) else tt("off", "关")))
     print(tt("  Tool-result steps: ", "  工具结果步骤 ") +
           (p["cheap"] if p.get("cheap") else tt("same model as the question", "与提问相同的模型")))
 
@@ -1819,7 +1863,10 @@ Usage:
   ccauth agy use official           switch back to the Google sign-in
   ccauth agy cheap <name> <model|off>
                                     send tool-result steps to a cheaper model (first call keeps yours);
-                                    a question that starts with @h uses the cheaper model throughout
+                                    a question that starts with @h uses the cheaper model throughout,
+                                    @m keeps the chosen model throughout
+  ccauth agy writing <name> <on|off>
+                                    pin writing questions to the chosen model by keyword (default off)
   ccauth agy hint <name> <on|off|text>
                                     append a request-saving note to the system prompt
   ccauth agy save                   save the current Google session (done automatically on first switch)
@@ -1839,6 +1886,9 @@ Restart agy and the desktop app after switching.""",
   ccauth agy cheap <名字> <模型|off>
                                     带工具结果的步骤改用便宜模型，每个问题的第一次调用仍用所选模型
                                     以 @h 开头的问题从头到尾都用便宜模型
+                                    以 @m 开头的问题从头到尾都用所选模型
+  ccauth agy writing <名字> <on|off>
+                                    按关键词让写作类问题全程用所选模型（默认关）
   ccauth agy hint <名字> <on|off|文本>
                                     在系统提示末尾追加省调用提示词，也可以给自定义文本
   ccauth agy save                   保存当前官方登录态（第一次切走时会自动保存）
@@ -1892,6 +1942,10 @@ def agy_main(argv):
         if len(rest) != 2:
             die("needs_arg", cmd="agy cheap <name> <model|off>")
         acmd_cheap(rest[0], rest[1])
+    elif cmd == "writing":
+        if len(rest) != 2:
+            die("needs_arg", cmd="agy writing <name> <on|off>")
+        acmd_writing(rest[0], rest[1])
     elif cmd == "hint":
         if len(rest) != 2:
             die("needs_arg", cmd="agy hint <name> <on|off|text>")

@@ -196,9 +196,9 @@ ccauth agy cheap relay off                       # turn off
 ccauth agy hint relay off
 ```
 
-With `cheap` on, the bridge looks at the newest message. When it is your question the chosen model answers, and when it is a tool result the cheaper model answers. The first call of every question, which plans the work, stays on the strong model and the execution steps run on the cheaper one. A question that starts with `@h` uses the cheaper model for every call, which suits simple tasks.
+With `cheap` on, the bridge looks at the newest message. When it is your question the chosen model answers, and when it is a tool result the cheaper model answers. The first call of every question, which plans the work, stays on the strong model and the execution steps run on the cheaper one. A question that starts with `@h` uses the cheaper model for every call, which suits simple tasks, and `@m` keeps the chosen model for every call. `ccauth agy writing relay on` keeps questions with writing keywords (polish, rewrite, paper, .tex and so on) on the chosen model throughout. It is off by default.
 
-With `hint` on, the bridge asks the model to put independent tool calls into one turn, to read known paths directly and to answer once it has enough information. A custom text can be passed as the third argument instead of `on`.
+With `hint` on, the bridge asks the model to put independent tool calls into one turn, to read known paths directly, to finish research before writing the text in one step and to answer once it has enough information. A custom text can be passed as the third argument instead of `on`.
 
 The history carries thought signatures from both models. If the relay rejects a request over a signature, the bridge replaces the signatures with the skip value documented for Gemini and retries once. countTokens requests are estimated locally and not sent to the relay.
 
