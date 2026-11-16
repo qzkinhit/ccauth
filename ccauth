@@ -2026,10 +2026,22 @@ def agy_checkin_all(names=None, force_all=False):
         r = rec.get(n) or {}
         return r.get("date") == today and r.get("status") in ("done", "already")
 
+    last_host = {"host": None}
+
+    def pace(url):
+        """Leave 30 to 60 seconds between accounts on the same site so the requests do not come in a burst."""
+        import random
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc
+        if host == last_host["host"]:
+            time.sleep(random.uniform(30, 60))
+        last_host["host"] = host
+
     for n in sites:
         stamp = datetime.now().astimezone().isoformat(timespec="seconds")
         if done_today(n) and not force_all:
             continue
+        pace((_read_json(os.path.join(agy_sites_dir(), n + ".json"), {}) or {}).get("url", ""))
         try:
             status, got, bal = agy_site_checkin(n)
             word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到"),
@@ -2050,6 +2062,7 @@ def agy_checkin_all(names=None, force_all=False):
         if done_today(n) and not force_all:
             continue
         prov = agy_provider(n)
+        pace(prov.get("url", ""))
         sess = AgySession(prov)
         stamp = datetime.now().astimezone().isoformat(timespec="seconds")
         try:
@@ -2083,7 +2096,7 @@ def agy_checkin_install(on):
     py = sys.executable or "/usr/bin/python3"
     log = os.path.join(agy_store(), "checkin.log")
     times = "".join(f"<dict><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>"
-                    for h, m in ((0, 10), (9, 0), (15, 0), (21, 0)))
+                    for h, m in ((0, 10), (12, 10)))
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -2102,8 +2115,8 @@ def agy_checkin_install(on):
     with open(agy_checkin_plist(), "w") as f:
         f.write(plist)
     subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", agy_checkin_plist()], capture_output=True)
-    print(tt(f"Daily check-in scheduled at 00:10, 09:00, 15:00 and 21:00 and at login; log: {log}",
-             f"已设置每日自动签到，时间为 00:10、09:00、15:00、21:00 以及开机登录时，日志在 {log}"))
+    print(tt(f"Daily check-in scheduled at 00:10 and 12:10 and at login; log: {log}",
+             f"已设置每日自动签到，时间为 00:10、12:10 以及开机登录时，日志在 {log}"))
 
 
 def agy_status_checkin():
@@ -2447,7 +2460,7 @@ Usage:
   ccauth agy login <name> <username>
                                     log in to the relay account behind a key (password saved locally, mode 600)
   ccauth agy checkin [name] [--install|--uninstall]
-                                    daily check-in now, or schedule it four times a day
+                                    daily check-in now, or schedule it twice a day
   ccauth agy site <name> <url> <username> <user_id> [access_token]
                                     add a site whose daily bonus is granted on login
   ccauth agy writer <name> <model|off>

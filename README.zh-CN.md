@@ -223,11 +223,11 @@ ccauth agy fallback relay off        # 关闭
 ```sh
 ccauth agy login relay 用户名          # 登录 key 所属的账户，提示输入密码
 ccauth agy checkin                    # 立即为所有已登录账户签到，已签过的跳过
-ccauth agy checkin --install          # 每天 00:10、09:00、15:00、21:00 及开机登录时自动签到
+ccauth agy checkin --install          # 每天 00:10、12:10 及开机登录时自动签到
 ccauth agy checkin --uninstall        # 取消自动签到
 ```
 
-平时用刷新凭证换取短期令牌，刷新凭证在登录 30 天后过期，届时用保存的密码自动重新登录。密码与凭证保存在 `~/.ccauth/agy/providers/<名字>.json`，权限 600。一天内多次运行只会签到一次。结果写入 `~/.ccauth/agy/checkin.log`，`ccauth agy status` 显示每个账户今天是否已签到和领取的额度。站点开启人机验证时无法自动签到。
+平时用刷新凭证换取短期令牌，刷新凭证在登录 30 天后过期，届时用保存的密码自动重新登录。密码与凭证保存在 `~/.ccauth/agy/providers/<名字>.json`，权限 600。一天内多次运行只会签到一次，当天已成功的账户不再发请求，同一站点的多个账户之间间隔 30 到 60 秒。结果写入 `~/.ccauth/agy/checkin.log`，`ccauth agy status` 显示每个账户今天是否已签到和领取的额度。站点开启人机验证时无法自动签到。
 
 有些老版 NewAPI 站点不提供签到按钮，而是在每天第一次登录时发放额度。`ccauth agy site <名字> <地址> <用户名> <用户ID> [系统访问令牌]` 添加这类站点。签到时先用系统访问令牌读取额度日志，今天已有签到记录就跳过，没有才用账号密码登录一次，再读日志确认领取的额度。通过第三方登录注册的账户需要先在站点设置密码。
 

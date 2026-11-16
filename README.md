@@ -223,11 +223,11 @@ NewAPI relays (v1.0, short-lived access token plus a 30-day refresh cookie) that
 ```sh
 ccauth agy login relay USERNAME       # log in to the account behind a key, prompts for the password
 ccauth agy checkin                    # check in every logged-in account now, skipping ones already done
-ccauth agy checkin --install          # check in daily at 00:10, 09:00, 15:00, 21:00 and at login
+ccauth agy checkin --install          # check in daily at 00:10, 12:10 and at login
 ccauth agy checkin --uninstall        # stop the schedule
 ```
 
-The refresh cookie is exchanged for a short-lived token on each run. It expires 30 days after login, and the saved password is then used to log in again. Password and cookie live in `~/.ccauth/agy/providers/<name>.json` with mode 600. Running several times a day checks in once. Results go to `~/.ccauth/agy/checkin.log`, and `ccauth agy status` shows whether each account checked in today and what it received. Relays that require a captcha for check-in cannot be automated this way.
+The refresh cookie is exchanged for a short-lived token on each run. It expires 30 days after login, and the saved password is then used to log in again. Password and cookie live in `~/.ccauth/agy/providers/<name>.json` with mode 600. Running several times a day checks in once, accounts already done today send no request, and accounts on the same site are spaced 30 to 60 seconds apart. Results go to `~/.ccauth/agy/checkin.log`, and `ccauth agy status` shows whether each account checked in today and what it received. Relays that require a captcha for check-in cannot be automated this way.
 
 Some classic NewAPI sites have no check-in button and grant the bonus on the first login of the day. Add them with `ccauth agy site <name> <url> <username> <user_id> [access_token]`. A run first reads the quota log with the access token and skips the site if today's bonus is already there, otherwise logs in once with the password and reads the log again to report the amount. Accounts created through a third-party login need a password set on the site first.
 
