@@ -1988,6 +1988,57 @@ def acmd_writer(name, model):
     print(msg)
 
 
+def agy_quota_of(prov):
+    """Remaining and used dollars from a NewAPI-style relay, or an error string."""
+    base = prov["url"].rstrip("/")
+    hdr = {"Authorization": "Bearer " + prov["key"]}
+
+    def get(path):
+        req = urllib.request.Request(base + path, headers=hdr)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+    try:
+        tok = (get("/api/usage/token/") or {}).get("data") or {}
+    except Exception as e:
+        return None, None, str(e)
+    used_units = tok.get("total_used") or 0
+    per_dollar = 500000.0
+    try:
+        cents = (get("/v1/dashboard/billing/usage") or {}).get("total_usage")
+        if cents and used_units:
+            per_dollar = used_units / (cents / 100.0)
+    except Exception:
+        pass
+    user = tok.get("user_quota") or {}
+    if tok.get("unlimited_quota") and user:
+        left = user.get("total_available")
+    else:
+        left = tok.get("total_available")
+    left_usd = None if left is None else left / per_dollar
+    return left_usd, used_units / per_dollar, None
+
+
+def acmd_quota():
+    names = agy_provider_names()
+    if not names:
+        agy_die("No relays saved yet.", "还没有保存任何第三方")
+    act = agy_state().get("active")
+    for n in names:
+        p = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {})
+        left, used, err = agy_quota_of(p)
+        mark = "*" if n == act else " "
+        key = p.get("key") or ""
+        tail = "..." + key[-4:] if len(key) > 8 else ""
+        if err:
+            print(f"{mark} {n:<12} {tail:<8} " + tt("query failed: ", "查询失败 ") + err)
+            continue
+        flag = ""
+        if agy_exhausted(n):
+            flag = tt("  (used up today)", "  （今日已用完）")
+        print(f"{mark} {n:<12} {tail:<8} " + tt("left", "剩余") + f" ${left:,.2f}   "
+              + tt("used", "已用") + f" ${used:,.2f}{flag}")
+
+
 def acmd_list():
     act = agy_state().get("active", "official")
     st = agy_state()
@@ -2064,6 +2115,7 @@ Usage:
                                     pin writing questions to the chosen model by keyword (default off)
   ccauth agy hint <name> <on|off|text>
                                     append a request-saving note to the system prompt
+  ccauth agy quota                  show the remaining balance of every saved relay key
   ccauth agy writer <name> <model|off>
                                     steps the model marks as writing run on this model
   ccauth agy fallback <name> <other|off>
@@ -2090,6 +2142,7 @@ Restart agy and the desktop app after switching.""",
                                     按关键词让写作类问题全程用所选模型（默认关）
   ccauth agy hint <名字> <on|off|文本>
                                     在系统提示末尾追加省调用提示词，也可以给自定义文本
+  ccauth agy quota                  查看每个已保存 key 的剩余额度
   ccauth agy writer <名字> <模型|off>
                                     模型标记为写作的步骤改用这个模型
   ccauth agy fallback <名字> <备用名字|off>
@@ -2149,6 +2202,8 @@ def agy_main(argv):
         if len(rest) != 2:
             die("needs_arg", cmd="agy writing <name> <on|off>")
         acmd_writing(rest[0], rest[1])
+    elif cmd in ("quota", "balance"):
+        acmd_quota()
     elif cmd == "writer":
         if len(rest) != 2:
             die("needs_arg", cmd="agy writer <name> <model|off>")
