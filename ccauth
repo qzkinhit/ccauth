@@ -1938,9 +1938,16 @@ def agy_site_checkin(name):
                                      data=None if body is None else json.dumps(body).encode())
         try:
             with op.open(req, timeout=30) as r:
-                return json.loads(r.read() or b"{}")
+                raw = r.read() or b"{}"
         except urllib.error.HTTPError as e:
             return {"success": False, "message": f"HTTP {e.code}"}
+        try:
+            return json.loads(raw)
+        except ValueError:
+            if b"aliyun_waf" in raw or b"captcha" in raw:
+                raise RuntimeError(tt("the site's WAF asked for a captcha; will retry at the next run",
+                                      "站点 WAF 要求人机验证，下次定时运行再试"))
+            raise RuntimeError(tt("unexpected non-JSON reply", "站点返回了非 JSON 内容"))
 
     def today_award():
         r = call("/api/log/self?p=0&page_size=20&type=4")
@@ -1998,7 +2005,7 @@ def acmd_login(name, user):
              f"{name} 已登录 {user}（用户 ID {sess.acct.get('user_id')}），密码保存在本机配置文件（权限 600）"))
 
 
-def agy_checkin_all(names=None):
+def agy_checkin_all(names=None, force_all=False):
     sites = [n for n in agy_site_names() if not names or n in names]
     names = [n for n in (names or agy_provider_names())
              if n in agy_provider_names()
@@ -2009,8 +2016,16 @@ def agy_checkin_all(names=None):
     st = agy_state()
     rec = dict(st.get("checkin") or {})
     ok = True
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    def done_today(n):
+        r = rec.get(n) or {}
+        return r.get("date") == today and r.get("status") in ("done", "already")
+
     for n in sites:
         stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        if done_today(n) and not force_all:
+            continue
         try:
             status, got, bal = agy_site_checkin(n)
             word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到"),
@@ -2028,6 +2043,8 @@ def agy_checkin_all(names=None):
             rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": "error", "error": str(e)}
         print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
     for n in names:
+        if done_today(n) and not force_all:
+            continue
         prov = agy_provider(n)
         sess = AgySession(prov)
         stamp = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -2534,7 +2551,8 @@ def agy_main(argv):
         elif "--uninstall" in rest:
             agy_checkin_install(False)
         else:
-            sys.exit(0 if agy_checkin_all([a for a in rest if not a.startswith("-")] or None) else 1)
+            sys.exit(0 if agy_checkin_all([a for a in rest if not a.startswith("-")] or None,
+                                          force_all=bool([a for a in rest if not a.startswith("-")])) else 1)
     elif cmd in ("quota", "balance"):
         acmd_quota()
     elif cmd == "writer":
