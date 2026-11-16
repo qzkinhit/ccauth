@@ -2049,7 +2049,7 @@ def agy_checkin_all(names=None, force_all=False):
             gain = f" +${got:.2f}" if got else ""
             tail = (tt(", balance ", "，余额 ") + f"${bal:.2f}") if bal is not None else ""
             msg = f"{n}: {word}{gain}{tail}"
-            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"),
+            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "balance": bal,
                       "status": "error" if status == "nobonus" else status, "awarded": got,
                       "error": word if status == "nobonus" else None}
             ok = ok and status != "nobonus"
@@ -2073,7 +2073,8 @@ def agy_checkin_all(names=None, force_all=False):
             gain = f" +${got:.2f}" if got is not None else ""
             tail = (tt(", balance ", "，余额 ") + f"${bal:.2f}") if bal is not None else ""
             msg = f"{n} ({sess.acct.get('username')}): {word}{gain}{tail}"
-            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": status, "awarded": got}
+            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": status, "awarded": got,
+                      "balance": bal}
         except Exception as e:
             ok = False
             msg = f"{n}: " + tt("check-in failed: ", "签到失败：") + str(e)
@@ -2132,6 +2133,8 @@ def agy_status_checkin():
             line = tt("done today", "今天已签") + (f" +${r['awarded']:.2f}" if r.get("awarded") is not None else "")
         else:
             line = tt("not yet today, last ", "今天未签，上次 ") + (r.get("date") or "")
+        if r.get("balance") is not None:
+            line = f"{line:<16}" + tt("  balance after check-in ", "  签到后余额 ") + f"${r['balance']:.2f}"
         print(f"  {n:<12} {line}")
     sched = os.path.exists(agy_checkin_plist())
     print("  " + (tt("schedule: on", "自动签到 已开启") if sched else tt("schedule: off", "自动签到 未开启")))
