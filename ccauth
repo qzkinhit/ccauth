@@ -1966,6 +1966,10 @@ def agy_site_checkin(name):
         r = call("/api/user/login", "POST", {"username": site["username"], "password": site["password"]}, token=False)
         if not r.get("success"):
             raise RuntimeError(r.get("message") or "login failed")
+        uid = (r.get("data") or {}).get("id")
+        if uid and str(uid) != str(site.get("user_id") or ""):
+            site["user_id"] = str(uid)
+            _write_private(os.path.join(agy_sites_dir(), name + ".json"), json.dumps(site, indent=2))
         time.sleep(2)
         got = today_award()
         status = "done" if got is not None else "nobonus"
@@ -2542,8 +2546,10 @@ def agy_main(argv):
             die("needs_arg", cmd="agy login <name> <username>")
         acmd_login(rest[0], rest[1])
     elif cmd == "site":
-        if len(rest) not in (4, 5):
-            die("needs_arg", cmd="agy site <name> <url> <username> <user_id> [access_token]")
+        if len(rest) not in (3, 4, 5):
+            die("needs_arg", cmd="agy site <name> <url> <username> [user_id] [access_token]")
+        if len(rest) == 3:
+            rest = rest + [""]
         acmd_site(rest[0], rest[1], rest[2], rest[3], rest[4] if len(rest) == 5 else "")
     elif cmd == "checkin":
         if "--install" in rest:
