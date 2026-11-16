@@ -1480,6 +1480,33 @@ def agy_chain(prov):
     return fresh + [c for c in chain if c not in fresh]
 
 
+def agy_strip_images(contents, keep_last):
+    """Replace inline images (except in the newest message when keep_last) by a short note."""
+    n = 0
+    items = contents or []
+    upto = len(items) - 1 if keep_last else len(items)
+    for c in items[:upto]:
+        if not isinstance(c, dict):
+            continue
+        parts = c.get("parts") or []
+        for i, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            if "inlineData" in part or "inline_data" in part:
+                parts[i] = {"text": "[image omitted by the local bridge to keep the request under the relay size limit]"}
+                n += 1
+            fr = part.get("functionResponse")
+            if isinstance(fr, dict) and isinstance(fr.get("parts"), list):
+                kept = []
+                for sub in fr["parts"]:
+                    if isinstance(sub, dict) and ("inlineData" in sub or "inline_data" in sub):
+                        n += 1
+                    else:
+                        kept.append(sub)
+                fr["parts"] = kept
+    return n
+
+
 # ---- the bridge ------------------------------------------------------------
 
 def agy_bridge():
@@ -1692,6 +1719,15 @@ def agy_bridge():
                     else:
                         log("relay-error", 400, raw[:300])
                         return self.send(400, raw)
+                for keep_last in (True, False):
+                    if code_of(r) != 413:
+                        break
+                    r.read()
+                    n = agy_strip_images(payload.get("contents"), keep_last)
+                    if not n:
+                        continue
+                    log("relay-retry", "413 too large, removed", n, "older images" if keep_last else "images")
+                    r = self.relay(cand, cm, op, payload, stream)
                 if code_of(r) == 200:
                     if agy_exhausted(cand.get("name")):
                         agy_mark_exhausted(cand.get("name"), False)
