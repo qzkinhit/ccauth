@@ -216,6 +216,19 @@ ccauth agy fallback relay off        # 关闭
 
 中转站以额度用完、余额不足、key 过期或无效拒绝请求时，本地桥用备用 key 重发同一个请求，并把用完的 key 标记到当天零点。标记期间的请求直接从备用 key 开始，不再先试用完的那个。零点后标记解除，按每天刷新额度的中转站正好恢复。中转站上游号池冷却（报错含 cooling down 或无可用渠道）不触发切换，因为同一站点换 key 也会失败。手动切换仍用 `ccauth agy use <名字>`。`ccauth agy status` 末尾和 `ccauth agy quota` 都会列出每个 key 所属账户的剩余额度与已用额度，查询走中转站的令牌用量接口，不消耗模型调用。
 
+### 每日签到
+
+开启签到功能的 NewAPI 中转站（v1.0 版，登录后用短期令牌加 30 天刷新凭证）可以自动签到。
+
+```sh
+ccauth agy login relay 用户名          # 登录 key 所属的账户，提示输入密码
+ccauth agy checkin                    # 立即为所有已登录账户签到，已签过的跳过
+ccauth agy checkin --install          # 每天 00:10、09:00、15:00、21:00 及开机登录时自动签到
+ccauth agy checkin --uninstall        # 取消自动签到
+```
+
+平时用刷新凭证换取短期令牌，刷新凭证在登录 30 天后过期，届时用保存的密码自动重新登录。密码与凭证保存在 `~/.ccauth/agy/providers/<名字>.json`，权限 600。一天内多次运行只会签到一次。结果写入 `~/.ccauth/agy/checkin.log`，`ccauth agy status` 显示每个账户今天是否已签到和领取的额度。站点开启人机验证时无法自动签到。
+
 第三方模式目前只支持 macOS。
 
 ## 文件位置

@@ -216,6 +216,19 @@ ccauth agy fallback relay off        # turn off
 
 When the relay rejects a request because the key's quota or balance is used up, or the key has expired or is invalid, the bridge resends the same request with the fallback key and marks the used-up key until local midnight. While marked, requests start with the fallback key, so no request is spent on the used-up one. The mark clears at midnight, which suits relays that refill quota daily. An upstream pool outage (errors mentioning cooling down or no available channel) does not trigger a switch, since another key on the same relay fails the same way. Manual switching stays `ccauth agy use <name>`. `ccauth agy status` (at the end) and `ccauth agy quota` list the remaining and used balance behind each key through the relay's token-usage endpoint, which costs no model request.
 
+### Daily check-in
+
+NewAPI relays (v1.0, short-lived access token plus a 30-day refresh cookie) that offer a daily check-in can be checked in automatically.
+
+```sh
+ccauth agy login relay USERNAME       # log in to the account behind a key, prompts for the password
+ccauth agy checkin                    # check in every logged-in account now, skipping ones already done
+ccauth agy checkin --install          # check in daily at 00:10, 09:00, 15:00, 21:00 and at login
+ccauth agy checkin --uninstall        # stop the schedule
+```
+
+The refresh cookie is exchanged for a short-lived token on each run. It expires 30 days after login, and the saved password is then used to log in again. Password and cookie live in `~/.ccauth/agy/providers/<name>.json` with mode 600. Running several times a day checks in once. Results go to `~/.ccauth/agy/checkin.log`, and `ccauth agy status` shows whether each account checked in today and what it received. Relays that require a captcha for check-in cannot be automated this way.
+
 Third-party mode is implemented for macOS only.
 
 ## Files

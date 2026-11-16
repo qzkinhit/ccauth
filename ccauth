@@ -1815,6 +1815,205 @@ def agy_bridge():
     ThreadingHTTPServer(("127.0.0.1", AGY_PORT), Handler).serve_forever()
 
 
+# ---- daily check-in on NewAPI relays --------------------------------------
+
+AGY_CHECKIN_LABEL = "io.github.qzkinhit.ccauth-checkin"
+
+
+def agy_checkin_plist():
+    return os.path.join(HOME, "Library", "LaunchAgents", AGY_CHECKIN_LABEL + ".plist")
+
+
+class AgySession:
+    """Login state for one NewAPI account: a rotating refresh cookie plus a short-lived access token."""
+
+    def __init__(self, prov):
+        import http.cookiejar
+        self.prov = prov
+        self.base = prov["url"].rstrip("/")
+        self.acct = dict(prov.get("account") or {})
+        self.jar = http.cookiejar.CookieJar()
+        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        self.token = None
+
+    def _json(self, path, method="GET", body=None, auth=True):
+        h = {"Content-Type": "application/json"}
+        if auth and self.token:
+            h["Authorization"] = "Bearer " + self.token
+            h["New-Api-User"] = str(self.acct.get("user_id", ""))
+        if auth and self.acct.get("refresh") and not self.token:
+            h["Cookie"] = "new_api_refresh=" + self.acct["refresh"]
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, headers=h, method=method)
+        try:
+            with self.op.open(req, timeout=30) as r:
+                out = json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                out = json.loads(e.read() or b"{}")
+            except ValueError:
+                out = {}
+            out.setdefault("success", False)
+            out.setdefault("message", f"HTTP {e.code}")
+        for c in self.jar:
+            if c.name == "new_api_refresh":
+                self.acct["refresh"] = c.value
+        return out
+
+    def _take(self, r):
+        d = r.get("data") or {}
+        if r.get("success") and d.get("access_token"):
+            self.token = d["access_token"]
+            u = d.get("user") or {}
+            if u.get("id"):
+                self.acct["user_id"] = u["id"]
+            return True
+        return False
+
+    def login(self, password):
+        r = self._json("/api/user/login", "POST",
+                       {"username": self.acct["username"], "password": password}, auth=False)
+        if not self._take(r):
+            raise RuntimeError(r.get("message") or "login failed")
+
+    def ensure(self):
+        if self.acct.get("refresh") and self._take(self._json("/api/user/auth/refresh", "POST", {})):
+            return "refresh"
+        pw = self.acct.get("password")
+        if not pw:
+            raise RuntimeError(tt("session expired and no password saved; run ccauth agy login",
+                                  "登录已过期且没有保存密码，请运行 ccauth agy login"))
+        self.login(pw)
+        return "password"
+
+    def save(self):
+        p = _read_json(os.path.join(agy_provider_dir(), self.prov["name"] + ".json"), {})
+        p["account"] = self.acct
+        _write_private(os.path.join(agy_provider_dir(), self.prov["name"] + ".json"), json.dumps(p, indent=2))
+
+    def checkin(self):
+        """(status, dollars awarded today or None, balance dollars or None)."""
+        per = 500000.0
+        st = self._json("/api/user/checkin")
+        stats = (st.get("data") or {}).get("stats") or {}
+        status = "already"
+        if not stats.get("checked_in_today"):
+            r = self._json("/api/user/checkin", "POST", {})
+            if not r.get("success") and "already" not in (r.get("message") or "").lower():
+                raise RuntimeError(r.get("message") or "check-in failed")
+            status = "done"
+            stats = ((self._json("/api/user/checkin").get("data") or {}).get("stats") or {})
+        today = datetime.now().strftime("%Y-%m-%d")
+        got = None
+        for rec in stats.get("records") or []:
+            if rec.get("checkin_date") == today:
+                got = (rec.get("quota_awarded") or 0) / per
+        me = self._json("/api/user/self").get("data") or {}
+        bal = me.get("quota") / per if isinstance(me.get("quota"), (int, float)) else None
+        return status, got, bal
+
+
+def acmd_login(name, user):
+    prov = agy_provider(name)
+    import getpass
+    pw = os.environ.get("CCAUTH_PASSWORD") or (getpass.getpass(tt(f"Password for {user}: ", f"{user} 的密码："))
+                                               if sys.stdin.isatty() else sys.stdin.readline().rstrip("\n"))
+    sess = AgySession(dict(prov, account={"username": user}))
+    try:
+        sess.login(pw)
+    except Exception as e:
+        agy_die(f"Login failed: {e}", f"登录失败：{e}")
+    sess.acct["password"] = pw
+    sess.save()
+    print(tt(f"{name}: logged in as {user} (id {sess.acct.get('user_id')}); password saved in the provider file (mode 600).",
+             f"{name} 已登录 {user}（用户 ID {sess.acct.get('user_id')}），密码保存在本机配置文件（权限 600）"))
+
+
+def agy_checkin_all(names=None):
+    names = names or [n for n in agy_provider_names()
+                      if (_read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}).get("account")]
+    if not names:
+        agy_die("No account logged in yet. Run: ccauth agy login <name> <username>",
+                "还没有登录任何账户，先运行 ccauth agy login <名字> <用户名>")
+    st = agy_state()
+    rec = dict(st.get("checkin") or {})
+    ok = True
+    for n in names:
+        prov = agy_provider(n)
+        sess = AgySession(prov)
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            sess.ensure()
+            status, got, bal = sess.checkin()
+            sess.save()
+            word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到")}[status]
+            gain = f" +${got:.2f}" if got is not None else ""
+            tail = (tt(", balance ", "，余额 ") + f"${bal:.2f}") if bal is not None else ""
+            msg = f"{n} ({sess.acct.get('username')}): {word}{gain}{tail}"
+            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": status, "awarded": got}
+        except Exception as e:
+            ok = False
+            msg = f"{n}: " + tt("check-in failed: ", "签到失败：") + str(e)
+            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": "error", "error": str(e)}
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+    st = agy_state()
+    st["checkin"] = rec
+    agy_state_save(st)
+    return ok
+
+
+def agy_checkin_install(on):
+    uid = str(os.getuid())
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGY_CHECKIN_LABEL}"], capture_output=True)
+    if not on:
+        if os.path.exists(agy_checkin_plist()):
+            os.remove(agy_checkin_plist())
+        print(tt("Daily check-in schedule removed.", "已取消每日自动签到"))
+        return
+    py = sys.executable or "/usr/bin/python3"
+    log = os.path.join(agy_store(), "checkin.log")
+    times = "".join(f"<dict><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>"
+                    for h, m in ((0, 10), (9, 0), (15, 0), (21, 0)))
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{AGY_CHECKIN_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>{py}</string><string>{agy_script_path()}</string><string>agy</string><string>checkin</string>
+  </array>
+  <key>EnvironmentVariables</key><dict><key>CCAUTH_HOME</key><string>{STORE}</string></dict>
+  <key>StartCalendarInterval</key><array>{times}</array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+"""
+    os.makedirs(os.path.dirname(agy_checkin_plist()), exist_ok=True)
+    with open(agy_checkin_plist(), "w") as f:
+        f.write(plist)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", agy_checkin_plist()], capture_output=True)
+    print(tt(f"Daily check-in scheduled at 00:10, 09:00, 15:00 and 21:00 and at login; log: {log}",
+             f"已设置每日自动签到，时间为 00:10、09:00、15:00、21:00 以及开机登录时，日志在 {log}"))
+
+
+def agy_status_checkin():
+    rec = agy_state().get("checkin") or {}
+    if not rec:
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    print(tt("Daily check-in:", "每日签到"))
+    for n, r in sorted(rec.items()):
+        if r.get("status") == "error":
+            line = tt("failed: ", "失败 ") + (r.get("error") or "")
+        elif r.get("date") == today:
+            line = tt("done today", "今天已签") + (f" +${r['awarded']:.2f}" if r.get("awarded") is not None else "")
+        else:
+            line = tt("not yet today, last ", "今天未签，上次 ") + (r.get("date") or "")
+        print(f"  {n:<12} {line}")
+    sched = os.path.exists(agy_checkin_plist())
+    print("  " + (tt("schedule: on", "自动签到 已开启") if sched else tt("schedule: off", "自动签到 未开启")))
+
+
 # ---- commands --------------------------------------------------------------
 
 def acmd_add(name, url, key, models=None, default=None, force=False):
@@ -2061,6 +2260,10 @@ def acmd_list():
 def agy_status_keys():
     if not agy_provider_names():
         return
+    try:
+        agy_status_checkin()
+    except NameError:
+        pass
     print(tt("Relay keys (balance queried live, no model request):",
              "第三方 key 与余额（实时查询，不消耗模型调用）"))
     for line in agy_quota_lines():
@@ -2131,6 +2334,10 @@ Usage:
   ccauth agy hint <name> <on|off|text>
                                     append a request-saving note to the system prompt
   ccauth agy quota                  show the remaining balance of every saved relay key
+  ccauth agy login <name> <username>
+                                    log in to the relay account behind a key (password saved locally, mode 600)
+  ccauth agy checkin [name] [--install|--uninstall]
+                                    daily check-in now, or schedule it four times a day
   ccauth agy writer <name> <model|off>
                                     steps the model marks as writing run on this model
   ccauth agy fallback <name> <other|off>
@@ -2158,6 +2365,9 @@ Restart agy and the desktop app after switching.""",
   ccauth agy hint <名字> <on|off|文本>
                                     在系统提示末尾追加省调用提示词，也可以给自定义文本
   ccauth agy quota                  查看每个已保存 key 的剩余额度
+  ccauth agy login <名字> <用户名>   登录 key 所属的中转站账户（密码存在本机，权限 600）
+  ccauth agy checkin [名字] [--install|--uninstall]
+                                    立即签到，或设置每天定时自动签到
   ccauth agy writer <名字> <模型|off>
                                     模型标记为写作的步骤改用这个模型
   ccauth agy fallback <名字> <备用名字|off>
@@ -2217,6 +2427,17 @@ def agy_main(argv):
         if len(rest) != 2:
             die("needs_arg", cmd="agy writing <name> <on|off>")
         acmd_writing(rest[0], rest[1])
+    elif cmd == "login":
+        if len(rest) != 2:
+            die("needs_arg", cmd="agy login <name> <username>")
+        acmd_login(rest[0], rest[1])
+    elif cmd == "checkin":
+        if "--install" in rest:
+            agy_checkin_install(True)
+        elif "--uninstall" in rest:
+            agy_checkin_install(False)
+        else:
+            sys.exit(0 if agy_checkin_all([a for a in rest if not a.startswith("-")] or None) else 1)
     elif cmd in ("quota", "balance"):
         acmd_quota()
     elif cmd == "writer":
