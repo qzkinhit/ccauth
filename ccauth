@@ -1647,7 +1647,9 @@ def acmd_list():
     for n in agy_provider_names():
         p = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {})
         mark = "*" if act == n else " "
-        print(f"{mark} {n:<12} {p.get('url', ''):<34} {', '.join(p.get('models') or [])}")
+        key = p.get("key") or ""
+        tail = ("key ..." + key[-4:]) if len(key) > 8 else ""
+        print(f"{mark} {n:<12} {p.get('url', ''):<34} {tail:<12} {', '.join(p.get('models') or [])}")
 
 
 def acmd_status():
