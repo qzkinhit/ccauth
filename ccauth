@@ -1913,6 +1913,75 @@ class AgySession:
         return status, got, bal
 
 
+def agy_sites_dir():
+    return os.path.join(agy_store(), "sites")
+
+
+def agy_site_names():
+    d = agy_sites_dir()
+    return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+
+
+def agy_site_checkin(name):
+    """Sites that grant the daily bonus on login (classic NewAPI). Returns (status, awarded, balance)."""
+    site = _read_json(os.path.join(agy_sites_dir(), name + ".json"), {})
+    import http.cookiejar
+    base = site["url"].rstrip("/")
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    per = 500000.0
+
+    def call(path, method="GET", body=None, token=True):
+        h = {"Content-Type": "application/json", "New-Api-User": str(site.get("user_id", ""))}
+        if token and site.get("access_token"):
+            h["Authorization"] = site["access_token"]
+        req = urllib.request.Request(base + path, headers=h, method=method,
+                                     data=None if body is None else json.dumps(body).encode())
+        try:
+            with op.open(req, timeout=30) as r:
+                return json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return {"success": False, "message": f"HTTP {e.code}"}
+
+    def today_award():
+        r = call("/api/log/self?p=0&page_size=20&type=4")
+        d = r.get("data")
+        items = d.get("items") if isinstance(d, dict) else d
+        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        for it in items or []:
+            if it.get("created_at", 0) >= start and "签到" in (it.get("content") or ""):
+                m = re.search(r"[＄$]\s*([0-9.]+)", it.get("content") or "")
+                return float(m.group(1)) if m else 0.0
+        return None
+
+    got = today_award()
+    status = "already"
+    if got is None:
+        r = call("/api/user/login", "POST", {"username": site["username"], "password": site["password"]}, token=False)
+        if not r.get("success"):
+            raise RuntimeError(r.get("message") or "login failed")
+        time.sleep(2)
+        got = today_award()
+        status = "done" if got is not None else "nobonus"
+    me = call("/api/user/self").get("data") or {}
+    bal = me.get("quota") / per if isinstance(me.get("quota"), (int, float)) else None
+    return status, got, bal
+
+
+def acmd_site(name, url, user, uid, token):
+    import getpass
+    pw = os.environ.get("CCAUTH_PASSWORD") or (getpass.getpass(tt(f"Password for {user}: ", f"{user} 的密码："))
+                                               if sys.stdin.isatty() else sys.stdin.readline().rstrip("\n"))
+    if not NAME_RE.match(name):
+        die("bad_name", name=name)
+    if not url.startswith("http"):
+        url = "https://" + url
+    _write_private(os.path.join(agy_sites_dir(), name + ".json"),
+                   json.dumps({"name": name, "url": url.rstrip("/"), "username": user, "password": pw,
+                               "user_id": uid, "access_token": token, "mode": "login"}, indent=2))
+    print(tt(f"Saved check-in site {name} ({url}); the daily bonus is collected by logging in.",
+             f"已保存签到站点 {name}（{url}），每天通过登录领取签到额度"))
+
+
 def acmd_login(name, user):
     prov = agy_provider(name)
     import getpass
@@ -1930,14 +1999,34 @@ def acmd_login(name, user):
 
 
 def agy_checkin_all(names=None):
-    names = names or [n for n in agy_provider_names()
-                      if (_read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}).get("account")]
-    if not names:
+    sites = [n for n in agy_site_names() if not names or n in names]
+    names = [n for n in (names or agy_provider_names())
+             if n in agy_provider_names()
+             and (_read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}).get("account")]
+    if not names and not sites:
         agy_die("No account logged in yet. Run: ccauth agy login <name> <username>",
                 "还没有登录任何账户，先运行 ccauth agy login <名字> <用户名>")
     st = agy_state()
     rec = dict(st.get("checkin") or {})
     ok = True
+    for n in sites:
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            status, got, bal = agy_site_checkin(n)
+            word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到"),
+                    "nobonus": tt("logged in, but no check-in record today", "已登录，但今天没有签到记录")}[status]
+            gain = f" +${got:.2f}" if got else ""
+            tail = (tt(", balance ", "，余额 ") + f"${bal:.2f}") if bal is not None else ""
+            msg = f"{n}: {word}{gain}{tail}"
+            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"),
+                      "status": "error" if status == "nobonus" else status, "awarded": got,
+                      "error": word if status == "nobonus" else None}
+            ok = ok and status != "nobonus"
+        except Exception as e:
+            ok = False
+            msg = f"{n}: " + tt("check-in failed: ", "签到失败：") + str(e)
+            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": "error", "error": str(e)}
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
     for n in names:
         prov = agy_provider(n)
         sess = AgySession(prov)
@@ -2338,6 +2427,8 @@ Usage:
                                     log in to the relay account behind a key (password saved locally, mode 600)
   ccauth agy checkin [name] [--install|--uninstall]
                                     daily check-in now, or schedule it four times a day
+  ccauth agy site <name> <url> <username> <user_id> [access_token]
+                                    add a site whose daily bonus is granted on login
   ccauth agy writer <name> <model|off>
                                     steps the model marks as writing run on this model
   ccauth agy fallback <name> <other|off>
@@ -2368,6 +2459,8 @@ Restart agy and the desktop app after switching.""",
   ccauth agy login <名字> <用户名>   登录 key 所属的中转站账户（密码存在本机，权限 600）
   ccauth agy checkin [名字] [--install|--uninstall]
                                     立即签到，或设置每天定时自动签到
+  ccauth agy site <名字> <地址> <用户名> <用户ID> [系统访问令牌]
+                                    添加登录即签到的站点
   ccauth agy writer <名字> <模型|off>
                                     模型标记为写作的步骤改用这个模型
   ccauth agy fallback <名字> <备用名字|off>
@@ -2431,6 +2524,10 @@ def agy_main(argv):
         if len(rest) != 2:
             die("needs_arg", cmd="agy login <name> <username>")
         acmd_login(rest[0], rest[1])
+    elif cmd == "site":
+        if len(rest) not in (4, 5):
+            die("needs_arg", cmd="agy site <name> <url> <username> <user_id> [access_token]")
+        acmd_site(rest[0], rest[1], rest[2], rest[3], rest[4] if len(rest) == 5 else "")
     elif cmd == "checkin":
         if "--install" in rest:
             agy_checkin_install(True)

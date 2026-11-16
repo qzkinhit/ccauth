@@ -229,6 +229,8 @@ ccauth agy checkin --uninstall        # stop the schedule
 
 The refresh cookie is exchanged for a short-lived token on each run. It expires 30 days after login, and the saved password is then used to log in again. Password and cookie live in `~/.ccauth/agy/providers/<name>.json` with mode 600. Running several times a day checks in once. Results go to `~/.ccauth/agy/checkin.log`, and `ccauth agy status` shows whether each account checked in today and what it received. Relays that require a captcha for check-in cannot be automated this way.
 
+Some classic NewAPI sites have no check-in button and grant the bonus on the first login of the day. Add them with `ccauth agy site <name> <url> <username> <user_id> [access_token]`. A run first reads the quota log with the access token and skips the site if today's bonus is already there, otherwise logs in once with the password and reads the log again to report the amount. Accounts created through a third-party login need a password set on the site first.
+
 Third-party mode is implemented for macOS only.
 
 ## Files
