@@ -153,6 +153,40 @@ ln -s ~/.local/bin/ccauth ~/.local/bin/gauth
 gauth work
 ```
 
+## Antigravity
+
+`ccauth agy` 让 Antigravity（命令行 `agy` 与桌面版）在官方 Google 登录和第三方 Gemini 兼容中转站之间切换。
+
+```sh
+ccauth agy save                                  # 保存当前的官方登录态
+ccauth agy add relay --url https://relay.example.com --key sk-xxxx
+ccauth agy use relay                             # 切到中转站
+ccauth agy use official                          # 切回官方登录
+ccauth agy list                                  # * 标记当前模式
+ccauth agy status
+ccauth agy rm relay
+```
+
+`add` 会请求中转站的 `/v1/models`，记下所有 `gemini` 开头的模型。中转站的模型名带固定的思考档位后缀（如 `gemini-4-argon-high`）时，本地桥会把 Antigravity 请求的模型名（如 `gemini-4-argon-low`）映射到同一系列里可用的那一个。也可以用 `--models a,b` 手动指定列表，用 `--default` 指定兜底模型。
+
+切换后要重启 `agy` 与桌面版。已经打开的终端先执行 `exec $SHELL`。
+
+### 第三方模式做了什么
+
+| 部分 | 做法 |
+|---|---|
+| `agy` | 设置文件写入 `modelProvider: "gemini"`，shell 里的 `agy` 函数带上本地桥地址启动，`agy` 进入 API key 模式，不使用 Google 登录 |
+| 桌面版 | 桌面版没有 API key 模式。`launchctl setenv CLOUD_CODE_URL` 把它的后端地址指向本地桥 |
+| 本地桥 | 一个常驻在 `127.0.0.1:18765` 的 LaunchAgent。生成请求转给中转站，账号类请求（模型列表、配额等）用本地缓存应答 |
+| installation_id | 每个中转站使用自己的一份，切回官方时恢复原值 |
+| 官方登录态 | 不删除。第一次切走时自动备份钥匙串条目，切回时若条目缺失则用备份恢复 |
+
+发给中转站的只有对话内容、生成参数和中转站自己的 key。Google 的 OAuth token、项目号和 installation_id 不会发给中转站。生成请求也不会发给 Google。本地缓存中没有的账号类请求会原样转发给 Google 一次并写入缓存，之后不再转发。
+
+桌面版的模型列表在第三方模式下会被改写。中转站提供 Carbon 时解除 Carbon 的锁定，配额显示为满，中转站不提供的 Claude 与 GPT 模型不显示。
+
+第三方模式目前只支持 macOS。
+
 ## 文件位置
 
 | 路径 | 内容 |

@@ -153,6 +153,40 @@ ln -s ~/.local/bin/ccauth ~/.local/bin/gauth
 gauth work
 ```
 
+## Antigravity
+
+`ccauth agy` switches Antigravity (the `agy` CLI and the desktop app) between the Google sign-in and a third-party Gemini-compatible relay.
+
+```sh
+ccauth agy save                                  # save the current Google session
+ccauth agy add relay --url https://relay.example.com --key sk-xxxx
+ccauth agy use relay                             # switch to the relay
+ccauth agy use official                          # switch back to the Google sign-in
+ccauth agy list                                  # * marks the active mode
+ccauth agy status
+ccauth agy rm relay
+```
+
+`add` reads the relay's `/v1/models` and records every model whose id starts with `gemini`. Relays often expose one fixed thinking level per model (for example `gemini-4-argon-high`). The local bridge maps the id Antigravity asks for (for example `gemini-4-argon-low`) to the available model of the same family. `--models a,b` sets the list by hand and `--default` sets the fallback model.
+
+Restart `agy` and the desktop app after switching. In terminals that are already open, run `exec $SHELL` first.
+
+### What third-party mode changes
+
+| Part | Change |
+|---|---|
+| `agy` | `modelProvider: "gemini"` is written to its settings and the shell function `agy` passes the bridge address, so `agy` runs in API-key mode without the Google sign-in |
+| Desktop app | The app has no API-key mode. `launchctl setenv CLOUD_CODE_URL` points its backend at the local bridge |
+| Local bridge | A LaunchAgent on `127.0.0.1:18765`. Generation requests go to the relay. Account calls (model list, quota and so on) are answered from a local cache |
+| installation_id | Each relay gets its own. The official ids are restored on switching back |
+| Google session | Left in place. The keychain entry is backed up on the first switch and restored on switching back if it is missing |
+
+The relay receives the conversation, the generation settings and its own key. The Google OAuth token, the project id and the installation id are not sent to the relay, and generation requests are not sent to Google. An account call that is not in the local cache yet is forwarded to Google once and then served from the cache.
+
+In third-party mode the app's model list is rewritten. Carbon is unlocked when the relay serves it, quota shows as full, and Claude and GPT models, which the relay does not serve, are hidden.
+
+Third-party mode is implemented for macOS only.
+
 ## Files
 
 | Path | Contents |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ccauth - switch between multiple Claude Code accounts without re-running /login.
+"""ccauth - switch Claude Code, Gemini CLI and Antigravity between accounts and providers.
 
 Claude Code keeps one set of credentials at a time. On macOS they live in the
 login Keychain; on Linux they live in a file inside the config directory. The
@@ -22,10 +22,10 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 RESERVED = {"save", "use", "list", "ls", "status", "current", "rm", "remove",
-            "help", "version", "path", "gemini"}
+            "help", "version", "path", "gemini", "agy", "official"}
 
 # Account-scoped caches in the global config. They describe the previous
 # account's subscription and model entitlements, so they must be dropped on
@@ -89,6 +89,10 @@ Usage (Claude Code):
 
 Usage (Gemini CLI):
   ccauth gemini <subcommand>     manage Gemini CLI accounts (run 'ccauth gemini help')
+
+Usage (Antigravity: agy CLI and desktop app):
+  ccauth agy <subcommand>        switch between the Google sign-in and third-party relays
+                                 (run 'ccauth agy help')
 
 First run:
   1. ccauth save work            save the account you are logged in as
@@ -166,6 +170,9 @@ Profile directory:  {profiles}""",
 
 用法（Gemini CLI）
   ccauth gemini <子命令>         管理 Gemini CLI 账号（运行 ccauth gemini help 查看）
+
+用法（Antigravity，含 agy CLI 与桌面版）
+  ccauth agy <子命令>            在官方 Google 登录与第三方中转之间切换（运行 ccauth agy help 查看）
 
 首次配置
   1. ccauth save work            保存现在登录的账号
@@ -898,6 +905,873 @@ def gemini_main(argv):
         sys.exit(1)
 
 
+# --------------------------------------------------------------------------
+# Antigravity support (agy CLI and the Antigravity desktop app)
+# --------------------------------------------------------------------------
+#
+# Two modes.
+#   official    The Google sign-in that Antigravity already holds. ccauth only
+#               saves a copy of that session so it can be restored.
+#   <provider>  A third-party Gemini-compatible relay (base URL + key). The
+#               Google session is left in place but is not used for model
+#               calls:
+#                 * agy runs in its GEMINI_API_KEY mode (no sign-in at all),
+#                   pointed at a local bridge on 127.0.0.1.
+#                 * The desktop app has no API-key mode, so it is started with
+#                   CLOUD_CODE_URL pointing at the same bridge. The bridge
+#                   answers the app's account calls from a local cache and
+#                   sends generation requests to the relay. The Google token
+#                   and project id are never forwarded to the relay.
+#                 * Both get an installation_id private to the provider; the
+#                   official ids are restored on switching back.
+# The bridge also renames models: the app asks for e.g. gemini-4-argon-low
+# while a relay may only list gemini-4-argon-high.
+
+import uuid
+import urllib.error
+import urllib.request
+
+AGY_PORT = int(os.environ.get("CCAUTH_AGY_PORT", "18765"))
+AGY_LABEL = "io.github.qzkinhit.ccauth-agy"
+AGY_KC_SERVICE = "gemini"
+AGY_KC_ACCOUNT = "antigravity"
+AGY_LOCAL_KEY = "ccauth-local-bridge"
+AGY_GEN_OPS = ("streamGenerateContent", "generateContent", "countTokens")
+AGY_LEVELS = ["xhigh", "high", "medium", "low"]
+
+
+def tt(en, zh):
+    return zh if LANG == "zh" else en
+
+
+def agy_die(en, zh):
+    print("ccauth: " + tt(en, zh), file=sys.stderr)
+    sys.exit(1)
+
+
+def agy_store():
+    return os.path.join(STORE, "agy")
+
+
+def agy_state_file():
+    return os.path.join(agy_store(), "state.json")
+
+
+def agy_provider_dir():
+    return os.path.join(agy_store(), "providers")
+
+
+def agy_cache_dir():
+    return os.path.join(agy_store(), "cache")
+
+
+def agy_cli_dir():
+    return os.path.join(HOME, ".gemini", "antigravity-cli")
+
+
+def agy_app_dir():
+    return os.path.join(HOME, ".gemini", "antigravity")
+
+
+def agy_cli_settings():
+    return os.path.join(agy_cli_dir(), "settings.json")
+
+
+def agy_env_file():
+    return os.path.join(agy_store(), "env.sh")
+
+
+def agy_plist():
+    return os.path.join(HOME, "Library", "LaunchAgents", AGY_LABEL + ".plist")
+
+
+def _write_private(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".ccauth-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def agy_state():
+    return _read_json(agy_state_file(), {}) or {}
+
+
+def agy_state_save(st):
+    os.makedirs(agy_store(), exist_ok=True)
+    os.chmod(STORE, 0o700)
+    _write_private(agy_state_file(), json.dumps(st, indent=2))
+
+
+def agy_provider_path(name):
+    if not NAME_RE.match(name):
+        die("bad_name", name=name)
+    if name in RESERVED or name == "official":
+        die("reserved", name=name)
+    return os.path.join(agy_provider_dir(), name + ".json")
+
+
+def agy_provider_names():
+    d = agy_provider_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json"))
+
+
+def agy_provider(name):
+    p = _read_json(agy_provider_path(name))
+    if not p:
+        have = ", ".join(["official"] + agy_provider_names())
+        die("not_found", name=name, have=have)
+    return p
+
+
+# ---- official session (macOS keychain) -----------------------------------
+
+def agy_kc_read():
+    if not IS_MAC:
+        return None
+    p = subprocess.run(["security", "find-generic-password", "-s", AGY_KC_SERVICE,
+                        "-a", AGY_KC_ACCOUNT, "-w"], capture_output=True, text=True)
+    blob = p.stdout.strip()
+    return blob if p.returncode == 0 and blob else None
+
+
+def agy_kc_write(blob):
+    if "'" in blob:
+        die("kc_quote")
+    cmd = (f'add-generic-password -U -A -s "{AGY_KC_SERVICE}" '
+           f'-a "{AGY_KC_ACCOUNT}" -w \'{blob}\'\n')
+    subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
+    if agy_kc_read() != blob:
+        die("kc_verify")
+
+
+def agy_session_file():
+    return os.path.join(agy_store(), "official", "session")
+
+
+def agy_save_session(quiet=False):
+    blob = agy_kc_read()
+    if not blob:
+        if quiet:
+            return False
+        agy_die("No Antigravity sign-in found in the keychain. Sign in with agy or the app first.",
+                "钥匙串里没有 Antigravity 登录态，请先在 agy 或桌面版里登录 Google 账号")
+    _write_private(agy_session_file(), blob)
+    st = agy_state()
+    st["sessionSavedAt"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    agy_state_save(st)
+    if not quiet:
+        print(tt("Saved the official Antigravity session.", "已保存官方 Antigravity 登录态"))
+    return True
+
+
+# ---- installation ids ------------------------------------------------------
+
+def agy_id_files():
+    return {"cli": os.path.join(agy_cli_dir(), "installation_id"),
+            "app": os.path.join(agy_app_dir(), "installation_id")}
+
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def agy_ids_apply(owner):
+    """owner is 'official' or a provider name. Ids are kept per owner."""
+    keep = os.path.join(agy_store(), "ids")
+    st = agy_state()
+    current_owner = st.get("idOwner", "official")
+    for kind, path in agy_id_files().items():
+        live = _read_text(path)
+        if live:
+            _write_private(os.path.join(keep, f"{current_owner}.{kind}"), live)
+        want = _read_text(os.path.join(keep, f"{owner}.{kind}"))
+        if not want:
+            if owner == "official":
+                continue
+            want = str(uuid.uuid4())
+            _write_private(os.path.join(keep, f"{owner}.{kind}"), want)
+        if os.path.isdir(os.path.dirname(path)):
+            with open(path, "w") as f:
+                f.write(want)
+    st["idOwner"] = owner
+    agy_state_save(st)
+
+
+# ---- agy CLI settings and shell hook -------------------------------------
+
+def agy_cli_model_provider(on):
+    path = agy_cli_settings()
+    d = _read_json(path, {}) or {}
+    if on:
+        d["modelProvider"] = "gemini"
+    else:
+        d.pop("modelProvider", None)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+
+
+def agy_write_env(active):
+    if active:
+        body = ("# written by ccauth; third-party mode for agy\n"
+                "agy() {\n"
+                f"  GEMINI_API_KEY={AGY_LOCAL_KEY} "
+                f"GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:{AGY_PORT} "
+                "command agy \"$@\"\n"
+                "}\n")
+    else:
+        body = ("# written by ccauth; official mode for agy\n"
+                "unset -f agy 2>/dev/null\n")
+    _write_private(agy_env_file(), body)
+
+
+def agy_shell_rc():
+    shell = os.path.basename(os.environ.get("SHELL", ""))
+    return os.path.join(HOME, ".bashrc" if shell == "bash" else ".zshrc")
+
+
+def agy_install_hook():
+    rc = agy_shell_rc()
+    line = f'[ -f "{agy_env_file()}" ] && . "{agy_env_file()}"  # ccauth agy'
+    try:
+        with open(rc) as f:
+            if "# ccauth agy" in f.read():
+                return False
+    except OSError:
+        pass
+    with open(rc, "a") as f:
+        f.write("\n" + line + "\n")
+    return True
+
+
+# ---- bridge service (launchd) --------------------------------------------
+
+def agy_script_path():
+    return os.path.realpath(sys.argv[0])
+
+
+def agy_service_start():
+    if not IS_MAC:
+        return
+    py = sys.executable or "/usr/bin/python3"
+    log = os.path.join(agy_store(), "bridge.log")
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{AGY_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>{py}</string><string>{agy_script_path()}</string>
+    <string>agy</string><string>bridge</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>CCAUTH_HOME</key><string>{STORE}</string>
+    <key>HTTPS_PROXY</key><string>{os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""}</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+"""
+    os.makedirs(os.path.dirname(agy_plist()), exist_ok=True)
+    with open(agy_plist(), "w") as f:
+        f.write(plist)
+    uid = str(os.getuid())
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGY_LABEL}"], capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", agy_plist()], capture_output=True)
+    subprocess.run(["launchctl", "setenv", "CLOUD_CODE_URL", f"http://127.0.0.1:{AGY_PORT}"],
+                   capture_output=True)
+
+
+def agy_service_stop():
+    if not IS_MAC:
+        return
+    uid = str(os.getuid())
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGY_LABEL}"], capture_output=True)
+    if os.path.exists(agy_plist()):
+        os.remove(agy_plist())
+    subprocess.run(["launchctl", "unsetenv", "CLOUD_CODE_URL"], capture_output=True)
+
+
+def agy_bridge_alive():
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                f"http://127.0.0.1:{AGY_PORT}/ccauth/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def agy_running():
+    out = []
+    for pat, label in (("Antigravity.app/Contents/MacOS", "Antigravity"),
+                       ("/.local/bin/agy", "agy")):
+        try:
+            p = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=5)
+            if p.stdout.strip():
+                out.append(label)
+        except Exception:
+            pass
+    return out
+
+
+# ---- relay model discovery and mapping -----------------------------------
+
+def agy_fetch_models(url, key):
+    req = urllib.request.Request(url.rstrip("/") + "/v1/models",
+                                 headers={"Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read())
+    ids = [m.get("id", "") for m in data.get("data", [])]
+    return sorted(i for i in ids if i.lower().startswith("gemini"))
+
+
+def _level(name):
+    tail = name.rsplit("-", 1)[-1]
+    return tail if tail in AGY_LEVELS else ""
+
+
+def _family(name):
+    n = name.lower()
+    for fam in ("argon", "carbon", "hydrogen", "flash-lite", "flash", "pro"):
+        if fam in n:
+            return fam
+    return ""
+
+
+def agy_map_model(asked, models, default):
+    """Pick the relay model for a model id the app asked for."""
+    m = (asked or "").split("/")[-1].lower()
+    if m in models:
+        return m
+    base = m[:-len(_level(m)) - 1] if _level(m) else m
+    same = [x for x in models if x.lower() == base or x.lower().startswith(base + "-")]
+    if not same:
+        fam = _family(m)
+        if fam == "flash-lite":
+            same = [x for x in models if "flash" in x.lower()]
+        elif fam:
+            same = [x for x in models if fam in x.lower()]
+    if not same:
+        return default
+    want = _level(m)
+    for x in same:
+        if want and _level(x) == want:
+            return x
+    order = {lv: i for i, lv in enumerate(AGY_LEVELS)}
+    same.sort(key=lambda x: order.get(_level(x), len(AGY_LEVELS)))
+    return same[0]
+
+
+def agy_rewrite_models(data, models):
+    """Unlock what the relay serves in the app's model picker."""
+    ms = data.get("models")
+    if not isinstance(ms, dict):
+        return data
+    relay_fams = {_family(x) for x in models}
+    hide = []
+    for key, v in ms.items():
+        if not isinstance(v, dict):
+            continue
+        if v.get("modelProvider") in ("MODEL_PROVIDER_ANTHROPIC", "MODEL_PROVIDER_OPENAI"):
+            hide.append(key)
+            continue
+        if isinstance(v.get("quotaInfo"), dict):
+            v["quotaInfo"] = {"remainingFraction": 1}
+    if "carbon" in relay_fams:
+        old = ms.pop("gemini-4-carbon-disabled", None)
+        if old and "gemini-4-carbon-high" not in ms:
+            for k in ("disabled", "tagTitle", "tagDescription"):
+                old.pop(k, None)
+            old["displayName"] = "Gemini 4 Carbon (High)"
+            old["thinkingLevel"] = 3
+            old["quotaInfo"] = {"remainingFraction": 1}
+            ms["gemini-4-carbon-high"] = old
+    for sort in data.get("agentModelSorts") or []:
+        for g in sort.get("groups") or []:
+            ids = [i if i != "gemini-4-carbon-disabled" else "gemini-4-carbon-high"
+                   for i in g.get("modelIds") or []]
+            g["modelIds"] = [i for i in ids if i not in hide and i in ms]
+    return data
+
+
+def agy_rewrite_quota(data):
+    def walk(o):
+        if isinstance(o, dict):
+            if "remainingFraction" in o:
+                o["remainingFraction"] = 1
+                o.pop("description", None)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(data)
+    return data
+
+
+# ---- the bridge ------------------------------------------------------------
+
+def agy_bridge():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import gzip
+
+    log_lock = __import__("threading").Lock()
+
+    def log(*a):
+        with log_lock:
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
+
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    google = urllib.request.build_opener(urllib.request.ProxyHandler(
+        {"http": proxy, "https": proxy} if proxy else {}))
+    upstream = os.environ.get("CCAUTH_AGY_UPSTREAM", "https://daily-cloudcode-pa.googleapis.com")
+
+    def active():
+        st = agy_state()
+        name = st.get("active")
+        if not name or name == "official":
+            return None
+        return _read_json(os.path.join(agy_provider_dir(), name + ".json"))
+
+    def code_of(r):
+        return getattr(r, "status", None) or r.code
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def body(self):
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                buf = b""
+                while True:
+                    size = int(self.rfile.readline().strip().split(b";")[0] or b"0", 16)
+                    if size == 0:
+                        self.rfile.readline()
+                        break
+                    buf += self.rfile.read(size)
+                    self.rfile.readline()
+            else:
+                n = int(self.headers.get("Content-Length") or 0)
+                buf = self.rfile.read(n) if n else b""
+            if (self.headers.get("Content-Encoding") or "").lower() == "gzip":
+                buf = gzip.decompress(buf)
+            return buf
+
+        def send(self, code, data, ctype="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def error(self, code, msg):
+            self.send(code, json.dumps({"error": {"code": code, "message": msg}}).encode())
+
+        def do_GET(self):
+            if self.path.startswith("/ccauth/health"):
+                return self.send(200, b'{"ok":true}')
+            self.account_call(b"")
+
+        def do_POST(self):
+            data = self.body()
+            op = self.path.split("?")[0].rsplit(":", 1)[-1] if ":" in self.path else ""
+            prov = active()
+            try:
+                if prov and self.path.startswith("/v1internal:") and op in AGY_GEN_OPS:
+                    return self.cloudcode_gen(prov, op, data)
+                if prov and "/models/" in self.path:
+                    return self.gemini_api(prov, data)
+            except Exception as e:
+                log("error", self.path.split("?")[0], repr(e))
+                return self.error(502, "ccauth bridge: " + str(e))
+            self.account_call(data)
+
+        # Account calls of the desktop app. Served from the local cache in
+        # third-party mode; a call that has never been seen is fetched once.
+        def account_call(self, data):
+            path = self.path.split("?")[0]
+            op = path.rsplit(":", 1)[-1] if ":" in path else (
+                re.sub(r"[^A-Za-z0-9._-]+", "_", path.strip("/")) or "root")
+            prov = active()
+            cache = os.path.join(agy_cache_dir(), op + ".json")
+            raw = None
+            if prov and os.path.exists(cache):
+                with open(cache, "rb") as f:
+                    raw = f.read()
+                log("local", op)
+            if raw is None:
+                hdr = {k: v for k, v in self.headers.items()
+                       if k.lower() not in ("host", "content-length", "accept-encoding",
+                                            "connection", "transfer-encoding", "content-encoding")}
+                req = urllib.request.Request(upstream + self.path,
+                                             data=data if self.command == "POST" else None,
+                                             headers=hdr, method=self.command)
+                try:
+                    r = google.open(req, timeout=600)
+                except urllib.error.HTTPError as e:
+                    r = e
+                except Exception as e:
+                    return self.error(502, "ccauth bridge: " + str(e))
+                raw = r.read()
+                code = code_of(r)
+                log("google", op, code)
+                if code != 200:
+                    return self.send(code, raw, r.headers.get("Content-Type", "application/json"))
+                os.makedirs(agy_cache_dir(), exist_ok=True)
+                _write_private(cache, raw.decode("utf-8", "replace"))
+            if prov:
+                try:
+                    obj = json.loads(raw or b"{}")
+                    if op == "fetchAvailableModels":
+                        obj = agy_rewrite_models(obj, prov.get("models") or [])
+                    elif op == "retrieveUserQuotaSummary":
+                        obj = agy_rewrite_quota(obj)
+                    raw = json.dumps(obj).encode()
+                except ValueError:
+                    pass
+            self.send(200, raw)
+
+        def relay(self, prov, model, op, payload, stream):
+            url = (prov["url"].rstrip("/") + f"/v1beta/models/{model}:{op}"
+                   + ("?alt=sse" if stream else ""))
+            req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                         headers={"Content-Type": "application/json",
+                                                  "x-goog-api-key": prov["key"]})
+            try:
+                return direct.open(req, timeout=1800)
+            except urllib.error.HTTPError as e:
+                return e
+
+        def stream_back(self, r, wrap):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    obj = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                obj.pop("billing_usage", None)
+                if isinstance(obj.get("usageMetadata"), dict):
+                    obj["usageMetadata"].pop("billing_usage", None)
+                out = ("data: " + json.dumps({"response": obj} if wrap else obj)
+                       + "\r\n\r\n").encode()
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(out), out))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+
+        @staticmethod
+        def clean(payload):
+            for k in ("sessionId", "session_id", "labels", "cachedContent", "model"):
+                payload.pop(k, None)
+            return payload
+
+        def pick(self, prov, asked):
+            models = prov.get("models") or []
+            return agy_map_model(asked, models, prov.get("default") or (models[0] if models else asked))
+
+        # Desktop app path: Cloud Code envelope -> plain Gemini API.
+        def cloudcode_gen(self, prov, op, data):
+            j = json.loads(data or b"{}")
+            model = self.pick(prov, j.get("model"))
+            inner = self.clean(dict(j.get("request") or {}))
+            log("relay", op, j.get("model"), "->", model)
+            if op == "countTokens":
+                r = self.relay(prov, model, "countTokens", {"contents": inner.get("contents", [])}, False)
+                raw = r.read()
+                if code_of(r) != 200:
+                    raw = json.dumps({"totalTokens": len(json.dumps(inner)) // 4}).encode()
+                return self.send(200, raw)
+            stream = op == "streamGenerateContent"
+            r = self.relay(prov, model, op, inner, stream)
+            if code_of(r) != 200:
+                raw = r.read()
+                log("relay-error", code_of(r), raw[:300])
+                return self.send(code_of(r), raw)
+            if not stream:
+                return self.send(200, json.dumps({"response": json.loads(r.read())}).encode())
+            self.stream_back(r, True)
+
+        # agy GEMINI_API_KEY path: only the model name changes.
+        def gemini_api(self, prov, data):
+            path = self.path.split("?")[0]
+            asked, _, op = path.split("/models/", 1)[1].partition(":")
+            model = self.pick(prov, asked)
+            stream = "alt=sse" in self.path
+            payload = self.clean(json.loads(data or b"{}"))
+            log("relay", op, asked, "->", model)
+            r = self.relay(prov, model, op, payload, stream)
+            if code_of(r) != 200 or not stream:
+                raw = r.read()
+                if code_of(r) != 200:
+                    log("relay-error", code_of(r), raw[:300])
+                return self.send(code_of(r), raw)
+            self.stream_back(r, False)
+
+    if IS_MAC and active():
+        subprocess.run(["launchctl", "setenv", "CLOUD_CODE_URL", f"http://127.0.0.1:{AGY_PORT}"],
+                       capture_output=True)
+    log("bridge listening on", AGY_PORT)
+    ThreadingHTTPServer(("127.0.0.1", AGY_PORT), Handler).serve_forever()
+
+
+# ---- commands --------------------------------------------------------------
+
+def acmd_add(name, url, key, models=None, default=None, force=False):
+    path = agy_provider_path(name)
+    if os.path.exists(path) and not force:
+        agy_die(f"Provider {name} already exists. Pass --force to overwrite.",
+                f"第三方 {name} 已存在，加 --force 覆盖")
+    if not url or not key:
+        agy_die("add needs --url and --key", "add 需要 --url 和 --key")
+    if not url.startswith("http"):
+        url = "https://" + url
+    if not models:
+        try:
+            models = agy_fetch_models(url, key)
+        except Exception as e:
+            agy_die(f"Could not list models at {url}: {e}. Pass --models a,b to skip this.",
+                    f"无法从 {url} 读取模型列表（{e}），可以用 --models a,b 手动指定")
+    if not models:
+        agy_die("The relay lists no gemini-* models.", "该中转站没有 gemini 开头的模型")
+    default = default or next((m for m in models if "argon" in m), models[0])
+    os.makedirs(agy_provider_dir(), exist_ok=True)
+    _write_private(path, json.dumps({"name": name, "url": url.rstrip("/"), "key": key,
+                                     "models": models, "default": default,
+                                     "savedAt": datetime.now().astimezone().isoformat(timespec="seconds")},
+                                    indent=2))
+    print(tt(f"Saved provider {name} -> {url}", f"已保存第三方 {name} -> {url}"))
+    print(tt("  models: ", "  可用模型 ") + ", ".join(models))
+    print(tt(f"  Switch with: ccauth agy use {name}", f"  切换命令 ccauth agy use {name}"))
+
+
+def acmd_use(name):
+    if name == "official":
+        return acmd_use_official()
+    prov = agy_provider(name)
+    if not IS_MAC:
+        agy_die("Third-party mode for Antigravity is implemented for macOS only.",
+                "Antigravity 第三方模式目前只支持 macOS")
+    st = agy_state()
+    if st.get("active", "official") == "official":
+        agy_save_session(quiet=True)
+    agy_ids_apply(name)
+    agy_cli_model_provider(True)
+    agy_write_env(True)
+    hooked = agy_install_hook()
+    st = agy_state()
+    st["active"] = name
+    agy_state_save(st)
+    agy_service_start()
+    for _ in range(20):
+        if agy_bridge_alive():
+            break
+        time.sleep(0.25)
+    print(tt(f"Switched Antigravity to {name} ({prov['url']})",
+             f"Antigravity 已切到第三方 {name}（{prov['url']}）"))
+    if not agy_bridge_alive():
+        print(tt(f"  Warning: the local bridge is not answering, see {agy_store()}/bridge.log",
+                 f"  警告，本地桥没有响应，查看 {agy_store()}/bridge.log"))
+    agy_restart_note(hooked)
+
+
+def acmd_use_official():
+    agy_service_stop()
+    agy_ids_apply("official")
+    agy_cli_model_provider(False)
+    agy_write_env(False)
+    hooked = agy_install_hook()
+    st = agy_state()
+    st["active"] = "official"
+    agy_state_save(st)
+    restored = False
+    saved = _read_text(agy_session_file())
+    if IS_MAC and saved and not agy_kc_read():
+        agy_kc_write(saved)
+        restored = True
+    print(tt("Switched Antigravity to the official Google sign-in.",
+             "Antigravity 已切回官方 Google 登录"))
+    if restored:
+        print(tt("  (restored the saved session into the keychain)",
+                 "  （钥匙串里的登录态缺失，已用保存的副本恢复）"))
+    agy_restart_note(hooked)
+
+
+def agy_restart_note(hooked):
+    if hooked:
+        print(tt(f"  Added a line to {agy_shell_rc()}. Open a new terminal before running agy.",
+                 f"  已在 {agy_shell_rc()} 加了一行，新开一个终端再运行 agy"))
+    else:
+        print(tt("  In terminals that are already open, run: exec $SHELL",
+                 "  已经打开的终端里先运行 exec $SHELL 再用 agy"))
+    running = agy_running()
+    if "Antigravity" in running:
+        print(tt("  The Antigravity app is running. Quit it (Cmd+Q) and open it again.",
+                 "  Antigravity 桌面版正在运行，Cmd+Q 完全退出后重新打开才生效"))
+    else:
+        print(tt("  The Antigravity app picks this up the next time it starts.",
+                 "  Antigravity 桌面版下次启动时生效"))
+
+
+def acmd_list():
+    act = agy_state().get("active", "official")
+    st = agy_state()
+    mark = "*" if act == "official" else " "
+    when = st.get("sessionSavedAt")
+    print(f"{mark} {'official':<12} {tt('Google sign-in', 'Google 官方登录'):<34} "
+          + (t("saved_at", ts=when) if when else tt("(session not saved)", "（登录态未保存）")))
+    for n in agy_provider_names():
+        p = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {})
+        mark = "*" if act == n else " "
+        print(f"{mark} {n:<12} {p.get('url', ''):<34} {', '.join(p.get('models') or [])}")
+
+
+def acmd_status():
+    act = agy_state().get("active", "official")
+    if act == "official":
+        print(tt("Antigravity: official Google sign-in", "Antigravity 当前为官方 Google 登录"))
+        print(tt("  Session in keychain: ", "  钥匙串登录态 ") + (tt("yes", "有") if agy_kc_read() else tt("no", "无")))
+        print(tt("  Saved copy: ", "  保存的副本 ") + (tt("yes", "有") if os.path.exists(agy_session_file()) else tt("no", "无")))
+        return
+    p = _read_json(os.path.join(agy_provider_dir(), act + ".json"), {})
+    print(tt(f"Antigravity: third-party {act} ({p.get('url')})",
+             f"Antigravity 当前为第三方 {act}（{p.get('url')}）"))
+    print(tt("  Local bridge: ", "  本地桥 ") +
+          (tt(f"running on 127.0.0.1:{AGY_PORT}", f"运行中 127.0.0.1:{AGY_PORT}")
+           if agy_bridge_alive() else tt("NOT running", "未运行")))
+    print(tt("  Models: ", "  模型 ") + ", ".join(p.get("models") or []))
+
+
+def acmd_rm(name):
+    path = agy_provider_path(name)
+    if not os.path.exists(path):
+        agy_provider(name)
+    if agy_state().get("active") == name:
+        acmd_use_official()
+    os.remove(path)
+    print(t("removed", name=name))
+
+
+def acmd_path():
+    print(tt("Profiles:      ", "profile 目录   ") + agy_store())
+    print(tt("CLI settings:  ", "CLI 设置       ") + agy_cli_settings())
+    print(tt("Shell hook:    ", "shell 钩子     ") + agy_env_file())
+    print(tt("Bridge:        ", "本地桥         ") + f"http://127.0.0.1:{AGY_PORT}  ({agy_plist()})")
+    print(tt("Keychain:      ", "钥匙串条目     ") + f'service "{AGY_KC_SERVICE}", account "{AGY_KC_ACCOUNT}"')
+
+
+AGY_USAGE = {
+    "en": """ccauth {version} (agy) - switch Antigravity between the Google sign-in and third-party relays
+
+Usage:
+  ccauth agy add <name> --url URL --key KEY [--models a,b] [--default m] [--force]
+                                    save a Gemini-compatible relay; models are read from /v1/models
+  ccauth agy use <name>             switch agy and the desktop app to that relay
+  ccauth agy use official           switch back to the Google sign-in
+  ccauth agy save                   save the current Google session (done automatically on first switch)
+  ccauth agy list                   list official + saved relays, * marks the active one
+  ccauth agy status                 show the active mode
+  ccauth agy rm <name>              delete a relay
+  ccauth agy path                   show where things live
+
+Restart agy and the desktop app after switching.""",
+    "zh": """ccauth {version} (agy) - Antigravity 在官方 Google 登录与第三方中转之间切换
+
+用法
+  ccauth agy add <名字> --url 地址 --key 密钥 [--models a,b] [--default 模型] [--force]
+                                    保存一个 Gemini 兼容的中转站，模型列表自动从 /v1/models 读取
+  ccauth agy use <名字>             把 agy 和桌面版切到该中转站
+  ccauth agy use official           切回官方 Google 登录
+  ccauth agy save                   保存当前官方登录态（第一次切走时会自动保存）
+  ccauth agy list                   列出官方与已保存的中转站，* 标记当前
+  ccauth agy status                 显示当前模式
+  ccauth agy rm <名字>              删除一个中转站
+  ccauth agy path                   显示各文件位置
+
+切换后重启 agy 和桌面版生效。""",
+}
+
+
+def _opt(rest, flag):
+    if flag in rest:
+        i = rest.index(flag)
+        if i + 1 < len(rest):
+            val = rest[i + 1]
+            del rest[i:i + 2]
+            return val
+        del rest[i]
+    for i, a in enumerate(rest):
+        if a.startswith(flag + "="):
+            del rest[i]
+            return a.split("=", 1)[1]
+    return None
+
+
+def agy_main(argv):
+    if not argv:
+        return acmd_status()
+    cmd, rest = argv[0], list(argv[1:])
+    force = "--force" in rest or "-f" in rest
+    rest = [a for a in rest if a not in ("--force", "-f")]
+    if cmd == "add":
+        url, key = _opt(rest, "--url"), _opt(rest, "--key")
+        models = _opt(rest, "--models")
+        default = _opt(rest, "--default")
+        if len(rest) != 1:
+            die("needs_arg", cmd="agy add")
+        acmd_add(rest[0], url, key, [m.strip() for m in models.split(",")] if models else None,
+                 default, force)
+    elif cmd == "use":
+        if len(rest) != 1:
+            die("needs_arg", cmd="agy use")
+        acmd_use(rest[0])
+    elif cmd in ("rm", "remove"):
+        if len(rest) != 1:
+            die("needs_arg", cmd="agy rm")
+        acmd_rm(rest[0])
+    elif cmd == "save":
+        agy_save_session()
+    elif cmd in ("list", "ls"):
+        acmd_list()
+    elif cmd in ("status", "current"):
+        acmd_status()
+    elif cmd == "path":
+        acmd_path()
+    elif cmd == "bridge":
+        agy_bridge()
+    elif cmd in ("help", "--help", "-h"):
+        print(AGY_USAGE[LANG].format(version=VERSION))
+    elif (cmd == "official" or NAME_RE.match(cmd)) and not rest:
+        acmd_use(cmd)
+    else:
+        print(AGY_USAGE[LANG].format(version=VERSION))
+        sys.exit(1)
+
+
 def main():
     argv = sys.argv[1:]
     if os.path.basename(sys.argv[0]) == "gauth":
@@ -909,6 +1783,9 @@ def main():
     cmd, rest = argv[0], argv[1:]
     if cmd == "gemini":
         gemini_main(rest)
+        return
+    if cmd == "agy":
+        agy_main(rest)
         return
     force = "--force" in rest or "-f" in rest
     rest = [a for a in rest if a not in ("--force", "-f")]
