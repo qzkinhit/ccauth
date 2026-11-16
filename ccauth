@@ -1326,12 +1326,53 @@ def agy_rewrite_quota(data):
     return data
 
 
+def agy_uses_tags(contents):
+    """Antigravity wraps what the user typed in <USER_REQUEST>; other user-role text is the app's."""
+    for c in contents or []:
+        if isinstance(c, dict) and c.get("role") == "user":
+            for p in c.get("parts") or []:
+                if isinstance(p, dict) and "<USER_REQUEST>" in (p.get("text") or ""):
+                    return True
+    return False
+
+
 def agy_is_tool_step(contents):
-    """True when the newest message carries tool results rather than user text."""
+    """True when the newest message is not something the user typed: tool results, or an
+    app notice such as a finished background command."""
     if not isinstance(contents, list) or not contents:
         return False
     last = contents[-1] if isinstance(contents[-1], dict) else {}
-    return any(isinstance(p, dict) and "functionResponse" in p for p in last.get("parts") or [])
+    parts = last.get("parts") or []
+    if any(isinstance(p, dict) and "functionResponse" in p for p in parts):
+        return True
+    if last.get("role") == "user" and agy_uses_tags(contents):
+        text = "".join(p.get("text") or "" for p in parts if isinstance(p, dict))
+        return "<USER_REQUEST>" not in text
+    return False
+
+
+AGY_WRITE_MARK = "【写作】"
+AGY_WRITER_RULE = (
+    "Model routing: requests that follow tool results run on a cheaper model, except writing. "
+    "Writing means drafting or revising documents, reports, papers, slide text, speaker notes, "
+    "emails, review files or a long final written answer. When your next step is writing, begin "
+    "your message with " + AGY_WRITE_MARK + " and in the same turn issue any reads you still need; "
+    "the following step then runs on the writer model. Keep " + AGY_WRITE_MARK + " at the start of "
+    "each message while writing is still in progress, and drop it once the writing is done. Do not "
+    "use the marker for research, reading, searching, running commands or code edits. When you plan "
+    "a task, state which steps are writing.")
+
+
+def agy_write_marked(contents):
+    """The newest model message starts with the writing marker."""
+    for c in reversed(contents or []):
+        if not isinstance(c, dict) or c.get("role") != "model":
+            continue
+        for p in c.get("parts") or []:
+            if isinstance(p, dict) and not p.get("thought") and AGY_WRITE_MARK in (p.get("text") or "")[:200]:
+                return True
+        return False
+    return False
 
 
 AGY_HINT = ("Billing note from the user: every model request in this session is billed per call. "
@@ -1374,6 +1415,8 @@ def agy_question(contents):
             continue
         text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict))
         m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", text, re.S)
+        if not m and agy_uses_tags(contents):
+            continue
         return (m.group(1) if m else text).strip()
     return ""
 
@@ -1691,6 +1734,9 @@ def agy_bridge():
                     return cheap, kind + " " + why
                 if pin == "main":
                     return model, kind + " " + why
+                writer = prov.get("writer")
+                if step and writer and agy_write_marked(contents):
+                    return writer, kind + " writing"
                 if step:
                     return cheap, kind
             return model, kind
@@ -1703,6 +1749,8 @@ def agy_bridge():
             hint = prov.get("hint")
             if hint and _family(model) not in ("flash", "flash-lite"):
                 agy_add_hint(payload, AGY_HINT if hint is True else hint)
+                if prov.get("writer") and prov.get("cheap"):
+                    agy_add_hint(payload, AGY_WRITER_RULE)
                 kind += " +hint"
             log("relay", op, asked, "->", model, kind)
             chain = agy_chain(prov)
@@ -1922,6 +1970,24 @@ def acmd_fallback(name, other):
     print(msg)
 
 
+def acmd_writer(name, model):
+    path = agy_provider_path(name)
+    p = agy_provider(name)
+    if model in ("off", "none", ""):
+        p.pop("writer", None)
+        msg = tt(f"{name}: writing steps use the cheap model like other tool steps.",
+                 f"{name} 已关闭写作模型，写作步骤和其他工具步骤一样用便宜模型")
+    else:
+        if p.get("models") and model not in p["models"]:
+            agy_die(f"{model} is not served by {name}. Available: {', '.join(p['models'])}",
+                    f"{name} 没有 {model}，可用的有 {', '.join(p['models'])}")
+        p["writer"] = model
+        msg = tt(f"{name}: steps the model marks with {AGY_WRITE_MARK} run on {model}.",
+                 f"{name} 模型标记为 {AGY_WRITE_MARK} 的写作步骤改用 {model}")
+    _write_private(path, json.dumps(p, indent=2))
+    print(msg)
+
+
 def acmd_list():
     act = agy_state().get("active", "official")
     st = agy_state()
@@ -1959,6 +2025,7 @@ def acmd_status():
           (tt("on", "开") if p.get("hint") else tt("off", "关")))
     print(tt("  Writing questions on the chosen model: ", "  写作类问题全程用所选模型 ") +
           (tt("on", "开") if p.get("writing", False) else tt("off", "关")))
+    print(tt("  Writing steps: ", "  写作步骤 ") + (p.get("writer") or tt("same as tool steps", "同工具步骤")))
     print(tt("  Tool-result steps: ", "  工具结果步骤 ") +
           (p["cheap"] if p.get("cheap") else tt("same model as the question", "与提问相同的模型")))
 
@@ -1997,6 +2064,8 @@ Usage:
                                     pin writing questions to the chosen model by keyword (default off)
   ccauth agy hint <name> <on|off|text>
                                     append a request-saving note to the system prompt
+  ccauth agy writer <name> <model|off>
+                                    steps the model marks as writing run on this model
   ccauth agy fallback <name> <other|off>
                                     when the key runs out or expires, switch to another relay until midnight
   ccauth agy save                   save the current Google session (done automatically on first switch)
@@ -2021,6 +2090,8 @@ Restart agy and the desktop app after switching.""",
                                     按关键词让写作类问题全程用所选模型（默认关）
   ccauth agy hint <名字> <on|off|文本>
                                     在系统提示末尾追加省调用提示词，也可以给自定义文本
+  ccauth agy writer <名字> <模型|off>
+                                    模型标记为写作的步骤改用这个模型
   ccauth agy fallback <名字> <备用名字|off>
                                     key 额度用完或失效时自动改用另一个，到当天零点再换回
   ccauth agy save                   保存当前官方登录态（第一次切走时会自动保存）
@@ -2078,6 +2149,10 @@ def agy_main(argv):
         if len(rest) != 2:
             die("needs_arg", cmd="agy writing <name> <on|off>")
         acmd_writing(rest[0], rest[1])
+    elif cmd == "writer":
+        if len(rest) != 2:
+            die("needs_arg", cmd="agy writer <name> <model|off>")
+        acmd_writer(rest[0], rest[1])
     elif cmd == "fallback":
         if len(rest) != 2:
             die("needs_arg", cmd="agy fallback <name> <other|off>")

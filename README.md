@@ -200,6 +200,10 @@ With `cheap` on, the bridge looks at the newest message. When it is your questio
 
 With `hint` on, the bridge asks the model to put independent tool calls into one turn, to read known paths directly, to finish research before writing the text in one step and to answer once it has enough information. A custom text can be passed as the third argument instead of `on`.
 
+`ccauth agy writer relay gemini-4-argon-high` adds a writer model. The bridge tells the model in the system prompt that when its next step is writing (documents, reports, slide text, speaker notes or a long written answer) it should begin the message with `【写作】`, keep the marker while writing and drop it when done. When the previous model message carries the marker, the bridge sends the step to the writer model, and other tool steps stay on the cheap model. The main model states the writing steps in its plan on the first call. A missed marker leaves the step on the cheap model and costs no extra request.
+
+Antigravity wraps only what the user typed in `<USER_REQUEST>`. Messages the app inserts itself, such as a finished background command, lack the tag and are treated as tool steps rather than new questions.
+
 The history carries thought signatures from both models. If the relay rejects a request over a signature, the bridge replaces the signatures with the skip value documented for Gemini and retries once. countTokens requests are estimated locally and not sent to the relay.
 
 ### Several keys with automatic fallback
