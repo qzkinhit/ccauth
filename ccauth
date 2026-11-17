@@ -1279,6 +1279,55 @@ def agy_map_model(asked, models, default):
     return same[0]
 
 
+AGY_MODEL_PREFERENCE = ("carbon", "argon", "hydrogen", "flash")
+AGY_MODELS_TTL = 900
+
+
+def agy_best_model(models):
+    """The strongest model the relay still lists, by family then thinking level."""
+    order = {lv: i for i, lv in enumerate(AGY_LEVELS)}
+    for fam in AGY_MODEL_PREFERENCE:
+        cands = [m for m in models if fam in m.lower() and "lite" not in m.lower()]
+        if cands:
+            cands.sort(key=lambda x: order.get(_level(x), len(AGY_LEVELS)))
+            return cands[0]
+    return models[0] if models else None
+
+
+def agy_model_gone(code, raw):
+    low = (raw or b"").decode("utf-8", "replace").lower()
+    return code in (400, 404, 503) and any(w in low for w in
+                                          ("no available channel", "model_not_found", "无可用渠道"))
+
+
+def agy_refresh_models(prov, force=False):
+    """Re-read the relay's model list at most every 15 minutes, or now when forced."""
+    now = time.time()
+    if not force and now - (prov.get("models_checked_at") or 0) < AGY_MODELS_TTL:
+        return prov
+    path = os.path.join(agy_provider_dir(), prov["name"] + ".json")
+    try:
+        models = agy_fetch_models(prov["url"], prov["key"])
+    except Exception:
+        models = None
+    disk = _read_json(path, {}) or {}
+    disk["models_checked_at"] = now
+    if models:
+        disk["models"] = models
+        prov["models"] = models
+    prov["models_checked_at"] = now
+    _write_private(path, json.dumps(disk, indent=2))
+    return prov
+
+
+def agy_available(model, prov):
+    """model if the relay lists it, else the closest listed model, else the strongest listed."""
+    models = prov.get("models") or []
+    if not models or model in models:
+        return model
+    return agy_map_model(model, models, agy_best_model(models))
+
+
 def agy_rewrite_models(data, models):
     """Unlock what the relay serves in the app's model picker."""
     ms = data.get("models")
@@ -1718,12 +1767,18 @@ def agy_bridge():
         def clean(payload):
             for k in ("sessionId", "session_id", "labels", "cachedContent", "model"):
                 payload.pop(k, None)
+            tc = (payload.get("generationConfig") or {}).get("thinkingConfig")
+            if isinstance(tc, dict) and isinstance(tc.get("thinkingLevel"), (int, float)):
+                # The app sends an enum number; relays expect a string. The relay model name
+                # already fixes the thinking level, so the field is dropped.
+                tc.pop("thinkingLevel")
             return payload
 
         def pick(self, prov, asked, payload):
             """Main model for a fresh user turn, the cheap model for tool-result steps."""
             models = prov.get("models") or []
-            model = agy_map_model(asked, models, prov.get("default") or (models[0] if models else asked))
+            default = prov.get("default") if prov.get("default") in models else agy_best_model(models)
+            model = agy_map_model(asked, models, default or asked)
             cheap = prov.get("cheap")
             contents = payload.get("contents")
             step = agy_is_tool_step(contents)
@@ -1745,7 +1800,12 @@ def agy_bridge():
             if op == "countTokens":
                 n = len(json.dumps(payload.get("contents", payload))) // 4
                 return self.send(200, json.dumps({"totalTokens": n}).encode())
+            agy_refresh_models(prov)
             model, kind = self.pick(prov, asked, payload)
+            wanted = model
+            model = agy_available(model, prov)
+            if model != wanted:
+                kind += f" ({wanted} unavailable)"
             hint = prov.get("hint")
             if hint and _family(model) not in ("flash", "flash-lite"):
                 agy_add_hint(payload, AGY_HINT if hint is True else hint)
@@ -1759,8 +1819,25 @@ def agy_bridge():
                 if cand is not prov and cand.get("models") and model not in cand["models"]:
                     cm = agy_map_model(model, cand["models"], cand.get("default") or cand["models"][0])
                 r = self.relay(cand, cm, op, payload, stream)
-                if code_of(r) == 400:
+                raw = None
+                if code_of(r) in (400, 404, 503):
                     raw = r.read()
+                    if agy_model_gone(code_of(r), raw):
+                        agy_refresh_models(cand, force=True)
+                        alt = agy_available(cm, cand)
+                        if alt == cm:
+                            alt = agy_best_model([m for m in (cand.get("models") or []) if m != cm])
+                        if alt and alt != cm:
+                            log("relay-retry", cm, "has no channel, using", alt)
+                            cm = alt
+                            r = self.relay(cand, cm, op, payload, stream)
+                            raw = None
+                    if raw is not None and code_of(r) != 400:
+                        log("relay-error", code_of(r), raw[:300])
+                        return self.send(code_of(r), raw)
+                if code_of(r) == 400:
+                    if raw is None:
+                        raw = r.read()
                     if b"signature" in raw.lower() and agy_patch_signatures(payload.get("contents")):
                         log("relay-retry", "thought signatures replaced")
                         r = self.relay(cand, cm, op, payload, stream)
