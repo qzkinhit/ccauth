@@ -25,7 +25,7 @@ from datetime import datetime
 VERSION = "1.3.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 RESERVED = {"save", "use", "list", "ls", "status", "current", "rm", "remove",
-            "help", "version", "path", "gemini", "agy", "official", "codex"}
+            "help", "version", "path", "gemini", "agy", "official", "codex", "state"}
 
 # Account-scoped caches in the global config. They describe the previous
 # account's subscription and model entitlements, so they must be dropped on
@@ -96,6 +96,9 @@ Usage (Antigravity: agy CLI and desktop app):
 
 Usage (Codex: Gemini main agent, CC Switch subagents):
   ccauth codex <subcommand>      run 'ccauth codex help'
+
+Machine-readable state (used by the macOS app):
+  ccauth state                   print all accounts, relays, check-in and Codex routing as JSON
 
 First run:
   1. ccauth save work            save the account you are logged in as
@@ -179,6 +182,9 @@ Profile directory:  {profiles}""",
 
 用法（Codex：主代理用 Gemini，子代理用 CC Switch 选中的服务商）
   ccauth codex <子命令>          运行 ccauth codex help 查看
+
+机器可读状态（供 macOS 应用读取）
+  ccauth state                   以 JSON 输出全部账号、中转站、签到与 Codex 分流状态
 
 首次配置
   1. ccauth save work            保存现在登录的账号
@@ -1187,7 +1193,7 @@ def agy_service_start():
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>CCAUTH_HOME</key><string>{STORE}</string>
-    <key>HTTPS_PROXY</key><string>{os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""}</string>
+    <key>HTTPS_PROXY</key><string>{system_https_proxy()}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -1255,7 +1261,7 @@ def _level(name):
 
 def _family(name):
     n = name.lower()
-    for fam in ("argon", "carbon", "hydrogen", "flash-lite", "flash", "pro"):
+    for fam in ("argon", "carbon", "neon", "hydrogen", "flash-lite", "flash", "pro"):
         if fam in n:
             return fam
     return ""
@@ -1285,7 +1291,7 @@ def agy_map_model(asked, models, default):
     return same[0]
 
 
-AGY_MODEL_PREFERENCE = ("carbon", "argon", "hydrogen", "flash")
+AGY_MODEL_PREFERENCE = ("carbon", "argon", "neon", "hydrogen", "flash")
 AGY_MODELS_TTL = 900
 
 
@@ -2659,7 +2665,10 @@ def agy_main(argv):
             sys.exit(0 if agy_checkin_all([a for a in rest if not a.startswith("-")] or None,
                                           force_all=bool([a for a in rest if not a.startswith("-")])) else 1)
     elif cmd in ("quota", "balance"):
-        acmd_quota()
+        if "--json" in rest:
+            gui_print_quota()
+        else:
+            acmd_quota()
     elif cmd == "writer":
         if len(rest) != 2:
             die("needs_arg", cmd="agy writer <name> <model|off>")
@@ -2974,6 +2983,10 @@ def codex_router():
             if not prov:
                 return self.send_json(502, {"error": {"message": f"ccauth codex: relay {st['relay']} not found"}})
             codex_clean_for_relay(j)
+            try:
+                agy_refresh_models(prov)
+            except Exception:
+                pass
             path = self.path[3:] if self.path.startswith("/v1") else self.path
             models = [j["model"]] + [m for m in st.get("fallback_models") or [] if m != j["model"]]
             chain = agy_chain(prov)
@@ -3030,7 +3043,7 @@ def codex_install(on):
         return
     py = sys.executable or "/usr/bin/python3"
     log = os.path.join(codex_store(), "router.log")
-    px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    px = system_https_proxy()
     common = (f"<key>EnvironmentVariables</key><dict><key>CCAUTH_HOME</key><string>{STORE}</string>"
               f"<key>HTTPS_PROXY</key><string>{px}</string></dict>"
               f"<key>StandardOutPath</key><string>{log}</string><key>StandardErrorPath</key><string>{log}</string>")
@@ -3177,6 +3190,94 @@ def codex_main(argv):
         sys.exit(0 if cmd in ("help", "--help", "-h") else 1)
 
 
+# --------------------------------------------------------------------------
+# GUI: a local web panel served on 127.0.0.1 (the macOS app wraps it in a window)
+# --------------------------------------------------------------------------
+
+def system_https_proxy():
+    """HTTPS proxy from the environment, else from macOS network settings."""
+    px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if px or not IS_MAC:
+        return px or ""
+    try:
+        out = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=5).stdout
+        on = re.search(r"HTTPSEnable\s*:\s*1", out)
+        host = re.search(r"HTTPSProxy\s*:\s*(\S+)", out)
+        port = re.search(r"HTTPSPort\s*:\s*(\d+)", out)
+        if on and host and port:
+            return f"http://{host.group(1)}:{port.group(1)}"
+    except Exception:
+        pass
+    return ""
+
+
+def gui_state():
+    here = cur_email()
+    claude = []
+    for n in prof_names():
+        try:
+            with open(prof_path(n)) as f:
+                d = json.load(f)
+            claude.append({"name": n, "email": d.get("email"), "savedAt": d.get("savedAt"),
+                           "current": d.get("email") == here})
+        except Exception:
+            pass
+    gactive = (gemini_accounts_load() or {}).get("active") if os.path.exists(gemini_accounts_file()) else None
+    gem = []
+    for n in gprof_names():
+        try:
+            with open(gprof_path(n)) as f:
+                d = json.load(f)
+            gem.append({"name": n, "email": d.get("email"), "savedAt": d.get("savedAt"),
+                        "current": d.get("email") == gactive})
+        except Exception:
+            pass
+    st = agy_state()
+    provs = []
+    for n in agy_provider_names():
+        p = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}
+        key = p.get("key") or ""
+        provs.append({"name": n, "url": p.get("url"), "key_tail": key[-4:] if len(key) > 8 else "",
+                      "models": p.get("models") or [], "cheap": p.get("cheap"), "writer": p.get("writer"),
+                      "hint": bool(p.get("hint")), "fallback": p.get("fallback"),
+                      "account": (p.get("account") or {}).get("username"),
+                      "exhausted": agy_exhausted(n)})
+    sites = []
+    for n in agy_site_names():
+        s = _read_json(os.path.join(agy_sites_dir(), n + ".json"), {}) or {}
+        sites.append({"name": n, "url": s.get("url"), "username": s.get("username"), "user_id": s.get("user_id")})
+    cs = codex_state()
+    return {
+        "version": VERSION,
+        "claude": {"current": here, "profiles": claude},
+        "gemini": {"current": gactive, "profiles": gem},
+        "agy": {"active": st.get("active", "official"), "bridge": agy_bridge_alive(),
+                "session_saved": os.path.exists(agy_session_file()), "providers": provs, "sites": sites},
+        "checkin": {"records": st.get("checkin") or {}, "scheduled": os.path.exists(agy_checkin_plist())},
+        "codex": {"enabled": bool(cs.get("enabled")), "main": cs.get("main"), "subagent": cs.get("subagent"),
+                  "relay": cs.get("relay"), "upstream": cs.get("upstream"),
+                  "ccswitch_model": cs.get("ccswitch_model"), "fallback_models": cs.get("fallback_models"),
+                  "router": codex_router_alive()},
+    }
+
+
+def gui_quota():
+    out = {}
+    for n in agy_provider_names():
+        p = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}
+        left, used, err = agy_quota_of(p)
+        out[n] = {"left": left, "used": used, "error": err}
+    return out
+
+
+def gui_print_state():
+    print(json.dumps(gui_state(), ensure_ascii=False, indent=1))
+
+
+def gui_print_quota():
+    print(json.dumps(gui_quota(), ensure_ascii=False, indent=1))
+
+
 def main():
     argv = sys.argv[1:]
     if os.path.basename(sys.argv[0]) == "gauth":
@@ -3194,6 +3295,9 @@ def main():
         return
     if cmd == "codex":
         codex_main(rest)
+        return
+    if cmd == "state":
+        gui_print_state()
         return
     force = "--force" in rest or "-f" in rest
     rest = [a for a in rest if a not in ("--force", "-f")]

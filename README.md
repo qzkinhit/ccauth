@@ -1,6 +1,6 @@
 # ccauth
 
-Switch between multiple Claude Code accounts with one command, without running `/login` every time.
+Switch between multiple Claude Code accounts with one command, without running `/login` every time. It also manages Gemini CLI accounts, third-party relays for Antigravity, model routing for Codex and daily check-in on relay sites, and ships a macOS app.
 
 [中文文档](README.zh-CN.md)
 
@@ -249,6 +249,18 @@ ccauth codex off                      # restore what CC Switch wrote
 When on, the provider's `base_url` points at the router, `model` becomes the main model and `[agents]` gets `default_subagent_model`. A LaunchAgent watches the file and, each time CC Switch rewrites it, records the new upstream and model and applies the edit again.
 
 Some relays answer a system prompt that introduces itself as Codex with 429. In requests sent to the Gemini relay, Codex and OpenAI in developer and system messages and in instructions are replaced with neutral wording. A cooling or withdrawn main model falls back to `gemini-4-hydrogen-xhigh`, then `gemini-3.8-flash-high`, and a used-up relay key follows the `ccauth agy fallback` setting. Changes apply to new Codex sessions.
+
+## macOS app
+
+`mac/` holds a native SwiftUI app covering every ccauth feature: Antigravity official and relay modes, relay settings and balances, Codex routing, daily check-in, and Claude and Gemini CLI accounts. Each action runs the `ccauth` command and the window is drawn from the JSON that `ccauth state` prints, so the app and the command line stay in step.
+
+```sh
+cd mac
+./build.sh            # builds mac/build/ccauth.app (Apple silicon and Intel)
+./build.sh --install  # also copies it to /Applications
+```
+
+Building needs the Xcode Command Line Tools (`xcode-select --install`); the app needs macOS 14 or later. It uses `~/.local/bin/ccauth` when present and the copy bundled inside the app otherwise.
 
 ## Files
 

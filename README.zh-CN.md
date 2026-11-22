@@ -1,6 +1,6 @@
 # ccauth
 
-一条命令在多个 Claude Code 账号之间切换，不用每次都跑 `/login`。
+一条命令在多个 Claude Code 账号之间切换，不用每次都跑 `/login`。也管理 Gemini CLI 账号、Antigravity 的第三方中转、Codex 的模型分流与公益站每日签到，并附带一个 macOS 软件。
 
 [English](README.md)
 
@@ -249,6 +249,18 @@ ccauth codex off                      # 恢复 CC Switch 写入的配置
 开启后，配置里服务商的 `base_url` 指向本地分流，`model` 改为主代理模型，`[agents]` 写入 `default_subagent_model`。一个 LaunchAgent 监视配置文件，CC Switch 每次切换服务商重写文件后，它记下新的上游地址和模型并重新应用这些修改。
 
 有些中转站会拒绝自称 Codex 的系统提示，返回 429。发往 Gemini 中转站的请求中，developer、system 消息和 instructions 里的 Codex、OpenAI 字样会被替换为中性说法。主代理模型冷却或下架时依次改用 `gemini-4-hydrogen-xhigh`、`gemini-3.8-flash-high`，中转站 key 额度用完时沿用 `ccauth agy fallback` 的设置换 key。设置对新开的 Codex 会话生效。
+
+## macOS 软件
+
+`mac/` 目录是一个原生 SwiftUI 软件，覆盖 ccauth 的全部功能：Antigravity 官方与第三方切换、中转站设置与余额、Codex 分流、每日签到、Claude 与 Gemini CLI 多账号。软件里的每个操作都调用 `ccauth` 命令，窗口内容来自 `ccauth state` 输出的 JSON，所以命令行与软件的功能一致。
+
+```sh
+cd mac
+./build.sh            # 生成 mac/build/ccauth.app（同时支持 Apple 芯片与 Intel）
+./build.sh --install  # 同时复制到 /Applications
+```
+
+构建需要 Xcode Command Line Tools（`xcode-select --install`），运行需要 macOS 14 或更高版本。软件优先使用 `~/.local/bin/ccauth`，找不到时使用打包在软件里的副本。
 
 ## 文件位置
 
