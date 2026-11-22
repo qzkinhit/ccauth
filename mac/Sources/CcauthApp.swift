@@ -84,6 +84,7 @@ struct CodexState: Decodable {
     var enabled: Bool
     var main: String?
     var subagent: String?
+    var subagent_effort: String?
     var relay: String?
     var upstream: String?
     var ccswitch_model: String?
@@ -439,9 +440,16 @@ struct CodexView: View {
                     }
                     Button("跟随 CC Switch") { store.run(["codex", "subagent", "follow"]) }
                 }
+                Picker("子代理强度", selection: Binding(get: { s.codex.subagent_effort ?? "max" },
+                                                    set: { store.run(["codex", "effort", $0]) })) {
+                    ForEach([("max", "max（最强）"), ("xhigh", "xhigh"), ("high", "high"), ("medium", "medium"),
+                             ("low", "low"), ("off", "交给 Codex 决定")], id: \.0) { Text($0.1).tag($0.0) }
+                }
                 LabeledContent("CC Switch 当前模型") { Text(s.codex.ccswitch_model ?? "?") }
                 LabeledContent("CC Switch 当前服务商") { Text(s.codex.upstream ?? "?").foregroundStyle(.secondary).textSelection(.enabled) }
-            } header: { Text("子代理（CC Switch 选中的公益站）") }
+            } header: { Text("子代理（CC Switch 选中的公益站）") } footer: {
+                Text("每个子代理请求的思考强度都统一改成这里的值，主代理派子代理时指定的强度也会被覆盖，Codex 后台小模型除外。服务商不接受时自动降一档并记住 30 分钟。").font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .onAppear { if s.codex.subagent != "follow" { sub = s.codex.subagent ?? "" } }

@@ -244,13 +244,14 @@ Codex sends the main agent and its subagents to one provider per session, and ro
 ccauth codex on                       # turn on, backing up ~/.codex/config.toml first
 ccauth codex subagent gpt-6.1-sol     # subagent model, default gpt-6.1-sol
 ccauth codex subagent follow          # subagents follow the model CC Switch picked
+ccauth codex effort max               # subagent reasoning effort, default max; off leaves it to Codex
 ccauth codex main gemini-4-neon-xhigh # main agent model
 ccauth codex status
 ccauth codex log -f                   # live request log: models, route, result, time, tokens
 ccauth codex off                      # restore what CC Switch wrote
 ```
 
-When on, the provider's `base_url` points at the router, `model` becomes the main model and `[agents]` gets `default_subagent_model`. A LaunchAgent watches the file and, each time CC Switch rewrites it, records the new upstream and model and applies the edit again.
+When on, the provider's `base_url` points at the router, `model` becomes the main model and `[agents]` gets `default_subagent_model` and `default_subagent_reasoning_effort`. The spawning agent can name its own effort and override that setting, so the router also sets `reasoning.effort` on every subagent request to the configured value, leaving Codex's background model `gpt-6-luna` alone. If the provider refuses that effort, the request is sent again one level lower and the lower level is kept for 30 minutes. A LaunchAgent watches the file and, each time CC Switch rewrites it, records the new upstream and model and applies the edit again.
 
 Some relays answer a system prompt that introduces itself as Codex with 429. In requests sent to the Gemini relay, Codex and OpenAI in developer and system messages and in instructions are replaced with neutral wording. A cooling or withdrawn main model falls back to `gemini-4-hydrogen-xhigh`, then `gemini-3.8-flash-high`, and a used-up relay key follows the `ccauth agy fallback` setting. Changes apply to new Codex sessions.
 

@@ -2942,7 +2942,16 @@ CODEX_ROUTER_LABEL = "io.github.qzkinhit.ccauth-codex"
 CODEX_SYNC_LABEL = "io.github.qzkinhit.ccauth-codex-sync"
 CODEX_ROUTER_URL = f"http://127.0.0.1:{CODEX_PORT}/v1"
 CODEX_DEFAULTS = {"main": "gemini-4-neon-xhigh", "subagent": "gpt-6.1-sol", "relay": "wududu",
+                  "subagent_effort": "max",
                   "fallback_models": ["gemini-4-hydrogen-xhigh", "gemini-3.8-flash-high"]}
+CODEX_EFFORTS = ("max", "xhigh", "high", "medium", "low")   # strongest first; an upstream refusal steps down
+CODEX_BACKGROUND = ("luna",)   # Codex's own background model keeps the effort Codex chose
+
+
+def codex_effort(st):
+    """The reasoning effort subagents run at, or None to leave it to Codex."""
+    e = str(st.get("subagent_effort") or "").strip().lower()
+    return e if e in CODEX_EFFORTS else None
 
 
 def codex_store():
@@ -3122,6 +3131,16 @@ def codex_sync(quiet=False):
     sub = st.get("ccswitch_model") if st["subagent"] == "follow" else st["subagent"]
     if sub and _toml_get(lines, "[agents]", "default_subagent_model") != sub:
         lines = _toml_set(lines, "[agents]", "default_subagent_model", sub)
+    eff = codex_effort(st)
+    cur_eff = _toml_get(lines, "[agents]", "default_subagent_reasoning_effort")
+    if eff and cur_eff != eff:
+        if cur_eff and "orig_subagent_effort" not in st:
+            st["orig_subagent_effort"] = cur_eff
+            changed_state = True
+        lines = _toml_set(lines, "[agents]", "default_subagent_reasoning_effort", eff)
+    if _toml_get(lines, None, "default_subagent_reasoning_effort") is not None:
+        # Codex only reads this key under [agents]; at the top level it is ignored with a warning.
+        lines = _toml_del(lines, None, "default_subagent_reasoning_effort")
     cat_now = _toml_get(lines, None, "model_catalog_json")
     if cat_now and cat_now != codex_catalog_path() and st.get("orig_catalog") != cat_now:
         st["orig_catalog"] = cat_now
@@ -3161,6 +3180,11 @@ def codex_restore():
     if st.get("ccswitch_model") and _toml_get(lines, None, "model") == st["main"]:
         lines = _toml_set(lines, None, "model", st["ccswitch_model"])
     lines = _toml_del(lines, "[agents]", "default_subagent_model")
+    if codex_effort(st) and _toml_get(lines, "[agents]", "default_subagent_reasoning_effort") == codex_effort(st):
+        if st.get("orig_subagent_effort"):
+            lines = _toml_set(lines, "[agents]", "default_subagent_reasoning_effort", st["orig_subagent_effort"])
+        else:
+            lines = _toml_del(lines, "[agents]", "default_subagent_reasoning_effort")
     if _toml_get(lines, None, "model_catalog_json") == codex_catalog_path():
         if st.get("orig_catalog"):
             lines = _toml_set(lines, None, "model_catalog_json", st["orig_catalog"])
@@ -3215,6 +3239,7 @@ def codex_router():
     lock = threading.Lock()
     cooled = {}
     unsupported = {}
+    effort_cap = {}   # (upstream, model) -> (strongest effort it accepted, until)
 
     def log(*a):
         with lock:
@@ -3329,6 +3354,13 @@ def codex_router():
                 rec["error"] = json.dumps(err, ensure_ascii=False)[:300]
                 rec["ok"] = False
 
+        def send_raw(self, code, raw, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype or "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
         def open(self, opener, url, body, hdr):
             req = urllib.request.Request(url, data=body if self.command == "POST" else None,
                                          headers=hdr, method=self.command)
@@ -3384,34 +3416,57 @@ def codex_router():
                                      f"当前服务商不支持 {model}，改用 {sub}")
                 else:
                     tries.append(sub)
-            for i, m in enumerate(tries):
+            # Subagent requests run at the configured effort, whatever the spawning agent asked for.
+            want = codex_effort(st) if (j and self.command == "POST" and "/responses" in path and not any(
+                b in (j.get("model") or "").lower() for b in CODEX_BACKGROUND)) else None
+            if want:
+                rec["effort_asked"] = (j.get("reasoning") or {}).get("effort")
+            dirty, i = False, 0
+            while i < len(tries):
+                m = tries[i]
                 if m and m != j.get("model"):
                     j["model"] = m
+                    dirty = True
+                if want:
+                    eff = want
+                    cap = effort_cap.get((up, m))
+                    if cap and cap[1] > time.time() and CODEX_EFFORTS.index(cap[0]) > CODEX_EFFORTS.index(eff):
+                        eff = cap[0]
+                    if (j.get("reasoning") or {}).get("effort") != eff:
+                        j["reasoning"] = dict(j.get("reasoning") or {}, effort=eff)
+                        dirty = True
+                    rec["effort"] = eff
+                if dirty:
                     body = json.dumps(j).encode()
+                    dirty = False
                 r = self.open(proxied, up + path, body, hdr)
                 code = code_of(r)
                 rec["tries"].append([m or "-", code])
                 rec["model"], rec["status"] = m, code
-                if code in (400, 404) and i + 1 < len(tries):
+                if code in (400, 404):
                     raw = r.read()
                     low = raw.lower()
-                    if m.encode() in raw or b"model" in low or "模型".encode() in raw:
+                    cur = (j.get("reasoning") or {}).get("effort")
+                    if want and code == 400 and b"effort" in low and cur in CODEX_EFFORTS[:-1]:
+                        nxt = CODEX_EFFORTS[CODEX_EFFORTS.index(cur) + 1]
+                        effort_cap[(up, m)] = (nxt, time.time() + CODEX_UNSUPPORTED_SECONDS)
+                        rec["note"] = raw[:200].decode("utf-8", "replace")
+                        log("upstream", m, "effort", cur, "refused -> retry with", nxt)
+                        continue
+                    if i + 1 < len(tries) and (m.encode() in raw or b"model" in low or "模型".encode() in raw):
                         unsupported[(up, m)] = time.time() + CODEX_UNSUPPORTED_SECONDS
                         rec["note"] = raw[:200].decode("utf-8", "replace")
                         log("upstream", m, code, "not offered -> retry with", tries[i + 1])
+                        i += 1
                         continue
                     rec["error"] = raw[:300].decode("utf-8", "replace")
-                    return self.send_json(404, json.loads(raw) if raw.startswith(b"{") else {"error": {"message": rec["error"]}})
+                    log("upstream", self.command, rec["path"], m or "-", code)
+                    return self.send_raw(code, raw, r.headers.get("Content-Type"))
                 log("upstream", self.command, rec["path"], m or "-", code)
                 if code != 200:
                     raw = r.read()
                     rec["error"] = raw[:300].decode("utf-8", "replace")
-                    self.send_response(code)
-                    self.send_header("Content-Type", r.headers.get("Content-Type", "application/json"))
-                    self.send_header("Content-Length", str(len(raw)))
-                    self.end_headers()
-                    self.wfile.write(raw)
-                    return
+                    return self.send_raw(code, raw, r.headers.get("Content-Type"))
                 return self.pipe(r, rec)
 
         def to_relay(self, st, j, hdr, rec):
@@ -3508,6 +3563,9 @@ def codex_log_format(r):
     head = (f"{(r.get('ts') or '')[11:19]} {'OK ' if r.get('ok') else 'ERR'} {r.get('route') or '-':<10} "
             f"{r.get('asked') or '-'}" + (f" -> {r.get('model')}" if r.get("model") != r.get("asked") else "") +
             f"  {r.get('ms', 0) / 1000:.1f}s{tok}  [{tries}]")
+    if r.get("effort"):
+        a = r.get("effort_asked")
+        head += "  " + tt("effort ", "强度 ") + (f"{a}->{r['effort']}" if a and a != r["effort"] else r["effort"])
     lines = [head]
     if r.get("user"):
         lines.append("    " + tt("asked: ", "提问：") + r["user"].replace("\n", " ")[:160])
@@ -3649,14 +3707,22 @@ def ccmd_set(key, value):
     value = (value or "").strip()
     if not value:
         agy_die("Model name is empty.", "模型名为空")
+    if key == "subagent_effort":
+        value = value.lower()
+        if value not in CODEX_EFFORTS + ("off",):
+            agy_die("Effort must be one of: " + ", ".join(CODEX_EFFORTS + ("off",)),
+                    "强度只能是 " + "、".join(CODEX_EFFORTS + ("off",)))
     st = codex_state()
     st[key] = value
     codex_state_save(st)
     if st.get("enabled"):
         codex_sync(quiet=True)
-    label = {"subagent": tt("Subagent model", "子代理模型"), "main": tt("Main model", "主代理模型")}[key]
+    label = {"subagent": tt("Subagent model", "子代理模型"), "main": tt("Main model", "主代理模型"),
+             "subagent_effort": tt("Subagent effort", "子代理强度")}[key]
     shown = (tt("follow CC Switch", "跟随 CC Switch") + f" ({st.get('ccswitch_model') or '?'})") \
         if value == "follow" else value
+    if key == "subagent_effort" and value == "off":
+        shown = tt("left to Codex", "交给 Codex 决定")
     print(f"{label}: {shown}")
     print(tt("  Applies to new Codex sessions.", "  对新开的 Codex 会话生效"))
 
@@ -3671,6 +3737,10 @@ def ccmd_status(header=True):
     print(tt("  Main agent:  ", "  主代理   ") + f"{st['main']} @ {st['relay']}"
           + tt(" (fallback ", "（冷却时改用 ") + ", ".join(st.get("fallback_models") or []) + tt(")", "）"))
     print(tt("  Subagents:   ", "  子代理   ") + f"{sub} @ " + (st.get("upstream") or "?"))
+    eff = codex_effort(st)
+    print(tt("  Subagent effort: ", "  子代理强度 ") + (
+        tt(f"{eff} (every subagent request; Codex background calls excluded)",
+           f"{eff}（所有子代理请求统一使用，Codex 后台小模型除外）") if eff else tt("left to Codex", "交给 Codex 决定")))
     print(tt("  CC Switch model: ", "  CC Switch 当前模型 ") + (st.get("ccswitch_model") or "?"))
     print(tt("  Router:      ", "  本地分流 ") + (tt(f"running on {CODEX_ROUTER_URL}", f"运行中 {CODEX_ROUTER_URL}")
                                                   if codex_router_alive() else tt("not running", "未运行")))
@@ -3684,6 +3754,7 @@ Usage:
   ccauth codex off                                restore the config CC Switch wrote
   ccauth codex subagent <model|follow>            subagent model (default gpt-6.1-sol; follow = CC Switch's)
   ccauth codex main <model>                       main agent model (default gemini-4-neon-xhigh)
+  ccauth codex effort <max|xhigh|high|medium|low|off>  subagent reasoning effort (default max)
   ccauth codex status                             show the routing
   ccauth codex log [-n N] [-f] [--json]           requests: model asked and used, route, result, time, tokens""",
     "zh": """ccauth {version} (codex) - Codex 主代理走 Gemini 中转站，子代理走 CC Switch 选中的服务商
@@ -3693,6 +3764,7 @@ Usage:
   ccauth codex off                                关闭分流，恢复 CC Switch 写入的配置
   ccauth codex subagent <模型|follow>             子代理模型（默认 gpt-6.1-sol，follow 表示跟随 CC Switch）
   ccauth codex main <模型>                        主代理模型（默认 gemini-4-neon-xhigh）
+  ccauth codex effort <max|xhigh|high|medium|low|off>  子代理思考强度（默认 max，off 表示交给 Codex）
   ccauth codex status                             查看分流状态
   ccauth codex log [-n 条数] [-f] [--json]        请求日志：请求与实际模型、去向、成败、耗时、token，-f 实时跟踪""",
 }
@@ -3710,6 +3782,8 @@ def codex_main(argv):
         ccmd_set("subagent", rest[0])
     elif cmd == "main" and len(rest) == 1:
         ccmd_set("main", rest[0])
+    elif cmd in ("effort", "subagent-effort") and len(rest) == 1:
+        ccmd_set("subagent_effort", rest[0])
     elif cmd in ("status", "current"):
         ccmd_status()
     elif cmd in ("log", "logs"):
@@ -3790,6 +3864,7 @@ def gui_state():
                 "session_saved": os.path.exists(agy_session_file()), "providers": provs, "sites": sites},
         "checkin": {"records": st.get("checkin") or {}, "scheduled": checkin_scheduled()},
         "codex": {"enabled": bool(cs.get("enabled")), "main": cs.get("main"), "subagent": cs.get("subagent"),
+                  "subagent_effort": codex_effort(cs) or "off",
                   "relay": cs.get("relay"), "upstream": cs.get("upstream"),
                   "ccswitch_model": cs.get("ccswitch_model"), "fallback_models": cs.get("fallback_models"),
                   "router": codex_router_alive()},
