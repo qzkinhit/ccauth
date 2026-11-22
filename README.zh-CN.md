@@ -243,6 +243,7 @@ ccauth codex subagent gpt-6.1-sol     # 子代理模型，默认 gpt-6.1-sol
 ccauth codex subagent follow          # 子代理跟随 CC Switch 当前选中的模型
 ccauth codex main gemini-4-neon-xhigh # 主代理模型
 ccauth codex status
+ccauth codex log -f                   # 实时查看请求：模型、去向、成败、耗时、token
 ccauth codex off                      # 恢复 CC Switch 写入的配置
 ```
 

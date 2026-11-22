@@ -382,7 +382,10 @@ struct CodexView: View {
                 }
                 HStack {
                     TextField("子代理模型", text: $sub, prompt: Text("如 gpt-6.1-sol"))
-                    Button("应用") { store.run(["codex", "subagent", sub.isEmpty ? "gpt-6.1-sol" : sub]) }
+                    Button("应用") {
+                        let v = sub.trimmingCharacters(in: .whitespacesAndNewlines)
+                        store.run(["codex", "subagent", v.isEmpty ? "gpt-6.1-sol" : v])
+                    }
                     Button("跟随 CC Switch") { store.run(["codex", "subagent", "follow"]) }
                 }
                 LabeledContent("CC Switch 当前模型") { Text(s.codex.ccswitch_model ?? "?") }
@@ -549,15 +552,120 @@ struct AccountsView: View {
     }
 }
 
+// MARK: - Codex request log
+
+struct Attempt: Decodable {
+    var model: String
+    var code: Int
+    init(from decoder: Decoder) throws {
+        var c = try decoder.unkeyedContainer()
+        model = (try? c.decode(String.self)) ?? "-"
+        code = (try? c.decode(Int.self)) ?? 0
+    }
+}
+
+struct LogRec: Decodable, Identifiable {
+    var ts: String?
+    var asked: String?
+    var model: String?
+    var route: String?
+    var ok: Bool?
+    var status: Int?
+    var ms: Int?
+    var ttfb_ms: Int?
+    var in_tokens: Int?
+    var out_tokens: Int?
+    var user: String?
+    var reply: String?
+    var error: String?
+    var tries: [Attempt]?
+    var path: String?
+    var id: String { (ts ?? "") + (asked ?? "") + String(ms ?? 0) + (user ?? "").prefix(20) }
+    var time: String { ts.map { String($0.dropFirst(11).prefix(8)) } ?? "" }
+    var modelText: String { (asked == model || model == nil) ? (asked ?? "-") : "\(asked ?? "-") → \(model ?? "-")" }
+    var seconds: String { String(format: "%.1fs", Double(ms ?? 0) / 1000) }
+    var tokens: String { in_tokens.map { "\($0) / \(out_tokens ?? 0)" } ?? "" }
+}
+
+struct CodexLogView: View {
+    @State private var rows: [LogRec] = []
+    @State private var live = true
+    @State private var selection: LogRec.ID?
+    @State private var note = ""
+
+    func load() async {
+        let (code, text) = await Runner.exec(["codex", "log", "--json", "-n", "300"])
+        guard code == 0, let data = text.data(using: .utf8),
+              let r = try? JSONDecoder().decode([LogRec].self, from: data) else {
+            note = text.isEmpty ? "" : String(text.prefix(300))
+            return
+        }
+        rows = r.reversed()
+        note = ""
+    }
+
+    var picked: LogRec? { rows.first { $0.id == selection } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Toggle("实时刷新", isOn: $live).toggleStyle(.switch)
+                Text("每 2 秒读取一次，最新的在最上面。只记录经过 ccauth 分流的请求。").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text("\(rows.count) 条").foregroundStyle(.secondary)
+                Button("立即刷新") { Task { await load() } }
+            }
+            .padding(10)
+            Table(rows, selection: $selection) {
+                TableColumn("时间") { Text($0.time).monospacedDigit() }.width(70)
+                TableColumn("结果") { r in
+                    Text(r.ok == true ? "成功" : "失败 \(r.status ?? 0)").foregroundStyle(r.ok == true ? .green : .red)
+                }.width(70)
+                TableColumn("去向") { Text($0.route ?? "-") }.width(90)
+                TableColumn("模型（请求 → 实际）") { Text($0.modelText) }.width(min: 180, ideal: 260)
+                TableColumn("耗时") { Text($0.seconds).monospacedDigit() }.width(55)
+                TableColumn("Token 入/出") { Text($0.tokens).monospacedDigit() }.width(90)
+                TableColumn("提问") { Text(($0.user ?? "").replacingOccurrences(of: "\n", with: " ")).lineLimit(1) }
+            }
+            if let r = picked {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("尝试过程：" + (r.tries ?? []).map { "\($0.model)（\($0.code)）" }.joined(separator: " → "))
+                        if let t = r.ttfb_ms { Text("首字耗时：\(String(format: "%.1f", Double(t) / 1000)) 秒，总耗时：\(r.seconds)") }
+                        if let u = r.user, !u.isEmpty { Text("提问：" + u) }
+                        if let p = r.reply, !p.isEmpty { Text("回复：" + p) }
+                        if let e = r.error, !e.isEmpty, r.ok != true { Text("错误：" + e).foregroundStyle(.red) }
+                    }
+                    .font(.system(.callout))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                }
+                .frame(height: 150)
+                .background(.bar)
+            }
+            if !note.isEmpty { Text(note).font(.caption).foregroundStyle(.secondary).padding(6) }
+        }
+        .task {
+            await load()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if live { await load() }
+            }
+        }
+    }
+}
+
 // MARK: - Window
 
 enum Page: String, CaseIterable, Identifiable {
-    case agy, codex, checkin, claude, gemini
+    case agy, codex, codexlog, checkin, claude, gemini
     var id: String { rawValue }
     var title: String {
         switch self {
         case .agy: return "Antigravity"
         case .codex: return "Codex 分流"
+        case .codexlog: return "Codex 日志"
         case .checkin: return "每日签到"
         case .claude: return "Claude 账号"
         case .gemini: return "Gemini CLI 账号"
@@ -567,6 +675,7 @@ enum Page: String, CaseIterable, Identifiable {
         switch self {
         case .agy: return "arrow.triangle.branch"
         case .codex: return "point.3.connected.trianglepath.dotted"
+        case .codexlog: return "list.bullet.rectangle"
         case .checkin: return "calendar.badge.checkmark"
         case .claude: return "person.crop.circle"
         case .gemini: return "person.2.circle"
@@ -590,6 +699,7 @@ struct ContentView: View {
                     switch page ?? .agy {
                     case .agy: AgyView(s: s)
                     case .codex: CodexView(s: s)
+                    case .codexlog: CodexLogView()
                     case .checkin: CheckinView(s: s)
                     case .claude:
                         AccountsView(title: "Claude Code 账号", note: "切换后重启 claude，正在运行的会话仍用旧账号。",

@@ -243,6 +243,7 @@ ccauth codex subagent gpt-6.1-sol     # subagent model, default gpt-6.1-sol
 ccauth codex subagent follow          # subagents follow the model CC Switch picked
 ccauth codex main gemini-4-neon-xhigh # main agent model
 ccauth codex status
+ccauth codex log -f                   # live request log: models, route, result, time, tokens
 ccauth codex off                      # restore what CC Switch wrote
 ```
 

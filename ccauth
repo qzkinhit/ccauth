@@ -2857,6 +2857,66 @@ def _toml_del(lines, header, key):
 
 # ---- sync: re-apply the routing after CC Switch writes the file ----
 
+def codex_catalog_path():
+    return os.path.join(codex_store(), "model-catalog.json")
+
+
+def codex_request_log():
+    return os.path.join(codex_store(), "requests.jsonl")
+
+
+def codex_catalog_entries(path):
+    try:
+        d = _read_json(path, {}) or {}
+        return [m for m in (d.get("models") or []) if isinstance(m, dict) and m.get("slug")]
+    except Exception:
+        return []
+
+
+def codex_write_catalog(st):
+    """A model catalog for the Codex picker: the relay's Gemini models, then the subagent models."""
+    home = os.path.dirname(codex_config_path())
+    cache = codex_catalog_entries(os.path.join(home, "models_cache.json"))
+    orig = codex_catalog_entries(st["orig_catalog"]) if st.get("orig_catalog") else []
+    ccs = codex_catalog_entries(os.path.join(home, "cc-switch-model-catalog.json"))
+    template = (cache or orig or ccs or [None])[0]
+    if template is None:
+        return None
+    prov = _read_json(os.path.join(agy_provider_dir(), st["relay"] + ".json"), {}) or {}
+    order = {fam: i for i, fam in enumerate(AGY_MODEL_PREFERENCE)}
+    gem = sorted([m for m in prov.get("models") or [] if m.lower().startswith("gemini")],
+                 key=lambda m: order.get(_family(m), 99))
+    if st["main"] not in gem:
+        gem.insert(0, st["main"])
+    subs = []
+    for m in [st["subagent"] if st["subagent"] != "follow" else None, st.get("ccswitch_model")] + \
+             [e["slug"] for e in orig + ccs]:
+        if m and m not in subs and m not in gem:
+            subs.append(m)
+    known = {e["slug"]: e for e in cache + orig + ccs}
+    out = []
+    for i, slug in enumerate(gem + subs):
+        e = json.loads(json.dumps(known.get(slug) or template))
+        e["slug"] = slug
+        e["visibility"] = "list"
+        e["priority"] = i
+        if slug in gem:
+            e["display_name"] = slug
+            e["description"] = tt(f"Gemini via {st['relay']} (ccauth)", f"经 {st['relay']} 的 Gemini（ccauth 分流）")
+            if isinstance(e.get("base_instructions"), str):
+                e["base_instructions"] = codex_neutralise(e["base_instructions"])
+            e.pop("upgrade", None)
+        elif slug not in known:
+            e["display_name"] = slug
+            e["description"] = tt("Subagent model on the CC Switch provider", "子代理模型，经 CC Switch 选中的服务商")
+        out.append(e)
+    path = codex_catalog_path()
+    data = json.dumps({"models": out}, ensure_ascii=False, indent=1)
+    if _read_text(path) != data:
+        _write_private(path, data)
+    return path
+
+
 def codex_sync(quiet=False):
     st = codex_state()
     if not st.get("enabled"):
@@ -2887,8 +2947,18 @@ def codex_sync(quiet=False):
     sub = st.get("ccswitch_model") if st["subagent"] == "follow" else st["subagent"]
     if sub and _toml_get(lines, "[agents]", "default_subagent_model") != sub:
         lines = _toml_set(lines, "[agents]", "default_subagent_model", sub)
+    cat_now = _toml_get(lines, None, "model_catalog_json")
+    if cat_now and cat_now != codex_catalog_path() and st.get("orig_catalog") != cat_now:
+        st["orig_catalog"] = cat_now
+        changed_state = True
+    if not cat_now and st.get("orig_catalog"):
+        st["orig_catalog"] = None
+        changed_state = True
     if changed_state:
         codex_state_save(st)
+    cat = codex_write_catalog(st)
+    if cat and cat_now != cat:
+        lines = _toml_set(lines, None, "model_catalog_json", cat)
     new = "\n".join(lines)
     if new != text:
         tmp = path + ".ccauth-tmp"
@@ -2916,6 +2986,11 @@ def codex_restore():
     if st.get("ccswitch_model") and _toml_get(lines, None, "model") == st["main"]:
         lines = _toml_set(lines, None, "model", st["ccswitch_model"])
     lines = _toml_del(lines, "[agents]", "default_subagent_model")
+    if _toml_get(lines, None, "model_catalog_json") == codex_catalog_path():
+        if st.get("orig_catalog"):
+            lines = _toml_set(lines, None, "model_catalog_json", st["orig_catalog"])
+        else:
+            lines = _toml_del(lines, None, "model_catalog_json")
     tmp = path + ".ccauth-tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(lines))
@@ -2941,15 +3016,44 @@ def codex_clean_for_relay(body):
     return body
 
 
+def codex_user_text(body):
+    """The newest thing the user typed, for the request log."""
+    for it in reversed(body.get("input") or []):
+        if not isinstance(it, dict) or it.get("role") != "user":
+            continue
+        for c in it.get("content") or []:
+            t = c.get("text") if isinstance(c, dict) else None
+            if isinstance(t, str) and t.strip() and not t.lstrip().startswith("<"):
+                return t.strip()
+    return ""
+
+
+CODEX_ALIASES = {"gpt-6-luna": "@subagent"}
+CODEX_COOLDOWN_SECONDS = 180
+
+
 def codex_router():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
 
     lock = threading.Lock()
+    cooled = {}
 
     def log(*a):
         with lock:
             print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
+
+    def record(rec):
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        path = codex_request_log()
+        with lock:
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > 5 * 1024 * 1024:
+                    os.replace(path, path + ".1")
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError:
+                pass
 
     direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
@@ -2957,6 +3061,9 @@ def codex_router():
 
     def code_of(r):
         return getattr(r, "status", None) or r.code
+
+    def sub_model(st):
+        return st.get("ccswitch_model") if st["subagent"] == "follow" else st["subagent"]
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -2981,20 +3088,69 @@ def codex_router():
             n = int(self.headers.get("Content-Length") or 0)
             self.route(self.rfile.read(n) if n else b"")
 
-        def pipe(self, r):
+        def pipe(self, r, rec):
+            """Stream the reply through and note the text and token usage for the log."""
             self.send_response(code_of(r))
             for k, v in r.headers.items():
                 if k.lower() not in ("content-length", "transfer-encoding", "connection", "content-encoding"):
                     self.send_header(k, v)
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            buf, reply, first = b"", [], True
+            sse = "event-stream" in (r.headers.get("Content-Type") or "")
+            whole = []
             while True:
                 chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
                 if not chunk:
                     break
+                if first:
+                    rec["ttfb_ms"] = int((time.time() - rec["_t0"]) * 1000)
+                    first = False
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                 self.wfile.flush()
+                if sse:
+                    buf += chunk
+                    *lines, buf = buf.split(b"\n")
+                    for ln in lines:
+                        self.note_event(ln, rec, reply)
+                elif sum(len(c) for c in whole) < 400000:
+                    whole.append(chunk)
             self.wfile.write(b"0\r\n\r\n")
+            if not sse and whole:
+                try:
+                    obj = json.loads(b"".join(whole))
+                    for o in obj.get("output") or []:
+                        for c in o.get("content") or []:
+                            if c.get("type") == "output_text":
+                                reply.append(c.get("text") or "")
+                    self.note_usage(obj.get("usage"), rec)
+                except ValueError:
+                    pass
+            rec["reply"] = "".join(reply)[:300]
+
+        @staticmethod
+        def note_usage(u, rec):
+            if isinstance(u, dict):
+                rec["in_tokens"] = u.get("input_tokens")
+                rec["out_tokens"] = u.get("output_tokens")
+
+        def note_event(self, ln, rec, reply):
+            ln = ln.strip()
+            if not ln.startswith(b"data:"):
+                return
+            try:
+                ev = json.loads(ln[5:].strip() or b"{}")
+            except ValueError:
+                return
+            t = ev.get("type") or ""
+            if t == "response.output_text.delta" and sum(len(x) for x in reply) < 300:
+                reply.append(ev.get("delta") or "")
+            elif t in ("response.completed", "response.done", "response.incomplete"):
+                self.note_usage((ev.get("response") or {}).get("usage"), rec)
+            elif t in ("response.failed", "error"):
+                err = (ev.get("response") or {}).get("error") or ev.get("error") or ev
+                rec["error"] = json.dumps(err, ensure_ascii=False)[:300]
+                rec["ok"] = False
 
         def open(self, opener, url, body, hdr):
             req = urllib.request.Request(url, data=body if self.command == "POST" else None,
@@ -3011,24 +3167,72 @@ def codex_router():
             except ValueError:
                 j = {}
             model = j.get("model") or ""
+            rec = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "_t0": time.time(),
+                   "path": self.path.split("?")[0], "asked": model, "model": model, "route": "", "tries": [],
+                   "ok": None, "status": None, "user": codex_user_text(j)[:200] if j else ""}
             hdr = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "content-length", "accept-encoding", "connection")}
             try:
                 if model.lower().startswith("gemini"):
-                    return self.to_relay(st, j, hdr)
-                up = (st.get("upstream") or "").rstrip("/")
-                if not up:
-                    return self.send_json(502, {"error": {"message": "ccauth codex: no upstream recorded yet"}})
-                path = self.path[3:] if self.path.startswith("/v1") and up.endswith("/v1") else self.path
-                r = self.open(proxied, up + path, body, hdr)
-                log("upstream", self.command, self.path.split("?")[0], model or "-", code_of(r))
-                self.pipe(r)
+                    self.to_relay(st, j, hdr, rec)
+                else:
+                    self.to_upstream(st, j, body, hdr, rec)
             except (BrokenPipeError, ConnectionResetError):
+                rec["error"] = (rec.get("error") or "") + " client closed"
                 log("client closed", model)
+            finally:
+                rec["ms"] = int((time.time() - rec.pop("_t0")) * 1000)
+                if rec["ok"] is None:
+                    rec["ok"] = rec["status"] == 200
+                if self.command == "POST":
+                    record(rec)
 
-        def to_relay(self, st, j, hdr):
+        def to_upstream(self, st, j, body, hdr, rec):
+            up = (st.get("upstream") or "").rstrip("/")
+            rec["route"] = "upstream"
+            if not up:
+                rec["status"] = 502
+                return self.send_json(502, {"error": {"message": "ccauth codex: no upstream recorded yet"}})
+            path = self.path[3:] if self.path.startswith("/v1") and up.endswith("/v1") else self.path
+            model = j.get("model") or ""
+            alias = CODEX_ALIASES.get(model)
+            if alias:
+                model = sub_model(st) if alias == "@subagent" else alias
+            tries = [model] if model else [""]
+            sub = sub_model(st)
+            if sub and model and sub != model:
+                tries.append(sub)
+            for i, m in enumerate(tries):
+                if m and m != j.get("model"):
+                    j["model"] = m
+                    body = json.dumps(j).encode()
+                r = self.open(proxied, up + path, body, hdr)
+                code = code_of(r)
+                rec["tries"].append([m or "-", code])
+                rec["model"], rec["status"] = m, code
+                if code == 404 and i + 1 < len(tries):
+                    raw = r.read()
+                    if b"model" in raw.lower():
+                        log("upstream", m, 404, "-> retry with", tries[i + 1])
+                        continue
+                    rec["error"] = raw[:300].decode("utf-8", "replace")
+                    return self.send_json(404, json.loads(raw) if raw.startswith(b"{") else {"error": {"message": rec["error"]}})
+                log("upstream", self.command, rec["path"], m or "-", code)
+                if code != 200:
+                    raw = r.read()
+                    rec["error"] = raw[:300].decode("utf-8", "replace")
+                    self.send_response(code)
+                    self.send_header("Content-Type", r.headers.get("Content-Type", "application/json"))
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                return self.pipe(r, rec)
+
+        def to_relay(self, st, j, hdr, rec):
             prov = _read_json(os.path.join(agy_provider_dir(), st["relay"] + ".json"))
             if not prov:
+                rec["status"] = 502
                 return self.send_json(502, {"error": {"message": f"ccauth codex: relay {st['relay']} not found"}})
             codex_clean_for_relay(j)
             try:
@@ -3037,23 +3241,30 @@ def codex_router():
                 pass
             path = self.path[3:] if self.path.startswith("/v1") else self.path
             models = [j["model"]] + [m for m in st.get("fallback_models") or [] if m != j["model"]]
+            now = time.time()
+            models = [m for m in models if cooled.get(m, 0) <= now] + [m for m in models if cooled.get(m, 0) > now]
             chain = agy_chain(prov)
             last = None
-            for pi, cand in enumerate(chain):
-                for mi, m in enumerate(models):
+            for cand in chain:
+                rec["route"] = cand["name"]
+                for m in models:
                     j["model"] = m
                     h = dict(hdr)
                     h["Authorization"] = "Bearer " + cand["key"]
                     r = self.open(direct, cand["url"].rstrip("/") + "/v1" + path, json.dumps(j).encode(), h)
                     code = code_of(r)
+                    rec["tries"].append([m, code])
+                    rec["model"], rec["status"] = m, code
                     if code == 200:
                         log("relay", cand["name"], m, 200)
+                        cooled.pop(m, None)
                         if agy_exhausted(cand["name"]):
                             agy_mark_exhausted(cand["name"], False)
-                        return self.pipe(r)
+                        return self.pipe(r, rec)
                     raw = r.read()
                     last = (code, raw)
                     low = raw.decode("utf-8", "replace").lower()
+                    rec["error"] = raw[:300].decode("utf-8", "replace")
                     log("relay", cand["name"], m, code, raw[:160])
                     if agy_key_exhausted(code, raw):
                         agy_mark_exhausted(cand["name"], True)
@@ -3061,10 +3272,12 @@ def codex_router():
                     if code in (429, 503, 404) and any(w in low for w in
                                                        ("cooling down", "exhausted", "no available channel",
                                                         "model_not_found", "无可用渠道")):
+                        cooled[m] = time.time() + CODEX_COOLDOWN_SECONDS
                         continue
                     return self.send_json(code, json.loads(raw) if raw.startswith(b"{") else
-                                          {"error": {"message": raw[:300].decode("utf-8", "replace")}})
+                                          {"error": {"message": rec["error"]}})
             code, raw = last or (502, b'{"error":{"message":"ccauth codex: relay failed"}}')
+            rec["status"] = code
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
@@ -3073,6 +3286,71 @@ def codex_router():
 
     log("codex router listening on", CODEX_PORT)
     ThreadingHTTPServer(("127.0.0.1", CODEX_PORT), Handler).serve_forever()
+
+
+def codex_log_lines(n):
+    path = codex_request_log()
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()[-n:]
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            pass
+    return out
+
+
+def codex_log_format(r):
+    tries = " > ".join(f"{m}:{c}" for m, c in r.get("tries") or [])
+    tok = ""
+    if r.get("in_tokens") is not None:
+        tok = f" {r.get('in_tokens')}/{r.get('out_tokens')} tok"
+    head = (f"{(r.get('ts') or '')[11:19]} {'OK ' if r.get('ok') else 'ERR'} {r.get('route') or '-':<10} "
+            f"{r.get('asked') or '-'}" + (f" -> {r.get('model')}" if r.get("model") != r.get("asked") else "") +
+            f"  {r.get('ms', 0) / 1000:.1f}s{tok}  [{tries}]")
+    lines = [head]
+    if r.get("user"):
+        lines.append("    " + tt("asked: ", "提问：") + r["user"].replace("\n", " ")[:160])
+    if r.get("reply"):
+        lines.append("    " + tt("reply: ", "回复：") + r["reply"].replace("\n", " ")[:160])
+    if r.get("error") and not r.get("ok"):
+        lines.append("    " + tt("error: ", "错误：") + r["error"].replace("\n", " ")[:200])
+    return "\n".join(lines)
+
+
+def ccmd_log(rest):
+    n = int(_opt(rest, "-n") or 30)
+    if "--json" in rest:
+        print(json.dumps(codex_log_lines(n), ensure_ascii=False))
+        return
+    for r in codex_log_lines(n):
+        print(codex_log_format(r))
+    if "-f" in rest or "--follow" in rest:
+        path = codex_request_log()
+        pos = os.path.getsize(path) if os.path.exists(path) else 0
+        try:
+            while True:
+                time.sleep(1)
+                if not os.path.exists(path):
+                    continue
+                size = os.path.getsize(path)
+                if size < pos:
+                    pos = 0
+                if size > pos:
+                    with open(path, encoding="utf-8") as f:
+                        f.seek(pos)
+                        for ln in f:
+                            try:
+                                print(codex_log_format(json.loads(ln)), flush=True)
+                            except ValueError:
+                                pass
+                        pos = f.tell()
+        except KeyboardInterrupt:
+            pass
 
 
 # ---- launchd ----
@@ -3170,6 +3448,9 @@ def ccmd_off():
 
 
 def ccmd_set(key, value):
+    value = (value or "").strip()
+    if not value:
+        agy_die("Model name is empty.", "模型名为空")
     st = codex_state()
     st[key] = value
     codex_state_save(st)
@@ -3205,7 +3486,8 @@ Usage:
   ccauth codex off                                restore the config CC Switch wrote
   ccauth codex subagent <model|follow>            subagent model (default gpt-6.1-sol; follow = CC Switch's)
   ccauth codex main <model>                       main agent model (default gemini-4-neon-xhigh)
-  ccauth codex status                             show the routing""",
+  ccauth codex status                             show the routing
+  ccauth codex log [-n N] [-f] [--json]           requests: model asked and used, route, result, time, tokens""",
     "zh": """ccauth {version} (codex) - Codex 主代理走 Gemini 中转站，子代理走 CC Switch 选中的服务商
 
 用法
@@ -3213,7 +3495,8 @@ Usage:
   ccauth codex off                                关闭分流，恢复 CC Switch 写入的配置
   ccauth codex subagent <模型|follow>             子代理模型（默认 gpt-6.1-sol，follow 表示跟随 CC Switch）
   ccauth codex main <模型>                        主代理模型（默认 gemini-4-neon-xhigh）
-  ccauth codex status                             查看分流状态""",
+  ccauth codex status                             查看分流状态
+  ccauth codex log [-n 条数] [-f] [--json]        请求日志：请求与实际模型、去向、成败、耗时、token，-f 实时跟踪""",
 }
 
 
@@ -3231,6 +3514,8 @@ def codex_main(argv):
         ccmd_set("main", rest[0])
     elif cmd in ("status", "current"):
         ccmd_status()
+    elif cmd in ("log", "logs"):
+        ccmd_log(rest)
     elif cmd == "sync":
         codex_sync()
     elif cmd == "router":
