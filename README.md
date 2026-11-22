@@ -233,6 +233,23 @@ Some classic NewAPI sites have no check-in button and grant the bonus on the fir
 
 Third-party mode is implemented for macOS only.
 
+## Codex: Gemini main agent, CC Switch subagents
+
+Codex sends the main agent and its subagents to one provider per session, and role files cannot change the provider. `ccauth codex` runs a local router that splits by model name: requests for `gemini-*` go to the Gemini relay saved with `ccauth agy add`, every other model goes to the upstream CC Switch last wrote into `~/.codex/config.toml`, with the request's own Authorization header.
+
+```sh
+ccauth codex on                       # turn on, backing up ~/.codex/config.toml first
+ccauth codex subagent gpt-6.1-sol     # subagent model, default gpt-6.1-sol
+ccauth codex subagent follow          # subagents follow the model CC Switch picked
+ccauth codex main gemini-4-neon-xhigh # main agent model
+ccauth codex status
+ccauth codex off                      # restore what CC Switch wrote
+```
+
+When on, the provider's `base_url` points at the router, `model` becomes the main model and `[agents]` gets `default_subagent_model`. A LaunchAgent watches the file and, each time CC Switch rewrites it, records the new upstream and model and applies the edit again.
+
+Some relays answer a system prompt that introduces itself as Codex with 429. In requests sent to the Gemini relay, Codex and OpenAI in developer and system messages and in instructions are replaced with neutral wording. A cooling or withdrawn main model falls back to `gemini-4-hydrogen-xhigh`, then `gemini-3.8-flash-high`, and a used-up relay key follows the `ccauth agy fallback` setting. Changes apply to new Codex sessions.
+
 ## Files
 
 | Path | Contents |

@@ -233,6 +233,23 @@ ccauth agy checkin --uninstall        # 取消自动签到
 
 第三方模式目前只支持 macOS。
 
+## Codex：主代理用 Gemini，子代理用 CC Switch 的服务商
+
+Codex 同一会话里的主代理和子代理共用一个服务商，角色配置也改不了服务商。`ccauth codex` 在本机启动一个分流服务，按请求里的模型名分发：`gemini-` 开头的请求发往 `ccauth agy add` 保存的 Gemini 中转站，其余模型发往 CC Switch 最近写入 `~/.codex/config.toml` 的服务商，并沿用请求自带的认证头。
+
+```sh
+ccauth codex on                       # 开启，先备份 ~/.codex/config.toml
+ccauth codex subagent gpt-6.1-sol     # 子代理模型，默认 gpt-6.1-sol
+ccauth codex subagent follow          # 子代理跟随 CC Switch 当前选中的模型
+ccauth codex main gemini-4-neon-xhigh # 主代理模型
+ccauth codex status
+ccauth codex off                      # 恢复 CC Switch 写入的配置
+```
+
+开启后，配置里服务商的 `base_url` 指向本地分流，`model` 改为主代理模型，`[agents]` 写入 `default_subagent_model`。一个 LaunchAgent 监视配置文件，CC Switch 每次切换服务商重写文件后，它记下新的上游地址和模型并重新应用这些修改。
+
+有些中转站会拒绝自称 Codex 的系统提示，返回 429。发往 Gemini 中转站的请求中，developer、system 消息和 instructions 里的 Codex、OpenAI 字样会被替换为中性说法。主代理模型冷却或下架时依次改用 `gemini-4-hydrogen-xhigh`、`gemini-3.8-flash-high`，中转站 key 额度用完时沿用 `ccauth agy fallback` 的设置换 key。设置对新开的 Codex 会话生效。
+
 ## 文件位置
 
 | 路径 | 内容 |

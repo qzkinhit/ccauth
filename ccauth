@@ -22,10 +22,10 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 RESERVED = {"save", "use", "list", "ls", "status", "current", "rm", "remove",
-            "help", "version", "path", "gemini", "agy", "official"}
+            "help", "version", "path", "gemini", "agy", "official", "codex"}
 
 # Account-scoped caches in the global config. They describe the previous
 # account's subscription and model entitlements, so they must be dropped on
@@ -93,6 +93,9 @@ Usage (Gemini CLI):
 Usage (Antigravity: agy CLI and desktop app):
   ccauth agy <subcommand>        switch between the Google sign-in and third-party relays
                                  (run 'ccauth agy help')
+
+Usage (Codex: Gemini main agent, CC Switch subagents):
+  ccauth codex <subcommand>      run 'ccauth codex help'
 
 First run:
   1. ccauth save work            save the account you are logged in as
@@ -173,6 +176,9 @@ Profile directory:  {profiles}""",
 
 用法（Antigravity，含 agy CLI 与桌面版）
   ccauth agy <子命令>            在官方 Google 登录与第三方中转之间切换（运行 ccauth agy help 查看）
+
+用法（Codex：主代理用 Gemini，子代理用 CC Switch 选中的服务商）
+  ccauth codex <子命令>          运行 ccauth codex help 查看
 
 首次配置
   1. ccauth save work            保存现在登录的账号
@@ -2685,6 +2691,492 @@ def agy_main(argv):
         sys.exit(1)
 
 
+# --------------------------------------------------------------------------
+# Codex: Gemini main agent on a relay, subagents on the provider CC Switch picked
+# --------------------------------------------------------------------------
+#
+# Codex sends every request of one session to one provider, main agent and
+# subagents alike, and a role file cannot change the provider. ccauth therefore
+# points that provider at a local router that splits by model name:
+#   gemini-*  -> a relay saved with `ccauth agy add` (its key, its fallbacks);
+#                developer/system text is neutralised first, because some
+#                relays reject a system prompt that introduces itself as Codex
+#   anything  -> the upstream CC Switch last wrote into ~/.codex/config.toml,
+#                with the request's own Authorization header
+# A launchd watcher re-applies the edit each time CC Switch rewrites the file.
+
+CODEX_PORT = int(os.environ.get("CCAUTH_CODEX_PORT", "18766"))
+CODEX_ROUTER_LABEL = "io.github.qzkinhit.ccauth-codex"
+CODEX_SYNC_LABEL = "io.github.qzkinhit.ccauth-codex-sync"
+CODEX_ROUTER_URL = f"http://127.0.0.1:{CODEX_PORT}/v1"
+CODEX_DEFAULTS = {"main": "gemini-4-neon-xhigh", "subagent": "gpt-6.1-sol", "relay": "wududu",
+                  "fallback_models": ["gemini-4-hydrogen-xhigh", "gemini-3.8-flash-high"]}
+
+
+def codex_store():
+    return os.path.join(STORE, "codex")
+
+
+def codex_state_file():
+    return os.path.join(codex_store(), "state.json")
+
+
+def codex_state():
+    st = dict(CODEX_DEFAULTS)
+    st.update(_read_json(codex_state_file(), {}) or {})
+    return st
+
+
+def codex_state_save(st):
+    os.makedirs(codex_store(), exist_ok=True)
+    os.chmod(STORE, 0o700)
+    _write_private(codex_state_file(), json.dumps(st, indent=2))
+
+
+def codex_config_path():
+    return os.environ.get("CCAUTH_CODEX_CONFIG") or os.path.join(
+        os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "config.toml")
+
+
+# ---- minimal line-based TOML editing (keeps the rest of the file intact) ----
+
+def _toml_quote(v):
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _toml_sections(lines):
+    """[(header or None, start, end)] where lines[start:end] belong to the section."""
+    out, cur, start = [], None, 0
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("[") and not s.startswith("[["):
+            out.append((cur, start, i))
+            cur, start = s, i + 1
+    out.append((cur, start, len(lines)))
+    return out
+
+
+def _toml_get(lines, header, key):
+    for h, a, b in _toml_sections(lines):
+        if h == header:
+            for ln in lines[a:b]:
+                m = re.match(r"\s*" + re.escape(key) + r"\s*=\s*(.+?)\s*$", ln)
+                if m:
+                    v = m.group(1)
+                    if v.startswith('"'):
+                        m2 = re.match(r'"((?:[^"\\]|\\.)*)"', v)
+                        return m2.group(1) if m2 else v.strip('"')
+                    return v
+    return None
+
+
+def _toml_set(lines, header, key, value):
+    """Set key = "value" in the section `header` (None = top level). Returns new lines."""
+    lines = list(lines)
+    secs = _toml_sections(lines)
+    for h, a, b in secs:
+        if h == header:
+            for i in range(a, b):
+                if re.match(r"\s*" + re.escape(key) + r"\s*=", lines[i]):
+                    lines[i] = f"{key} = {_toml_quote(value)}"
+                    return lines
+            lines.insert(a if header else 0, f"{key} = {_toml_quote(value)}")
+            return lines
+    lines += ["", header, f"{key} = {_toml_quote(value)}"]
+    return lines
+
+
+def _toml_del(lines, header, key):
+    out, cur = [], None
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("[") and not s.startswith("[["):
+            cur = s
+        if cur == header and re.match(r"\s*" + re.escape(key) + r"\s*=", ln):
+            continue
+        out.append(ln)
+    return out
+
+
+# ---- sync: re-apply the routing after CC Switch writes the file ----
+
+def codex_sync(quiet=False):
+    st = codex_state()
+    if not st.get("enabled"):
+        return False
+    path = codex_config_path()
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return False
+    lines = text.split("\n")
+    prov = _toml_get(lines, None, "model_provider") or "custom"
+    header = f"[model_providers.{prov}]"
+    base = _toml_get(lines, header, "base_url")
+    changed_state = False
+    if base and base.rstrip("/") != CODEX_ROUTER_URL:
+        if st.get("upstream") != base:
+            st["upstream"] = base
+            changed_state = True
+        lines = _toml_set(lines, header, "base_url", CODEX_ROUTER_URL)
+    model = _toml_get(lines, None, "model")
+    if model and model != st["main"] and not model.lower().startswith("gemini"):
+        if st.get("ccswitch_model") != model:
+            st["ccswitch_model"] = model
+            changed_state = True
+    if model != st["main"]:
+        lines = _toml_set(lines, None, "model", st["main"])
+    sub = st.get("ccswitch_model") if st["subagent"] == "follow" else st["subagent"]
+    if sub and _toml_get(lines, "[agents]", "default_subagent_model") != sub:
+        lines = _toml_set(lines, "[agents]", "default_subagent_model", sub)
+    if changed_state:
+        codex_state_save(st)
+    new = "\n".join(lines)
+    if new != text:
+        tmp = path + ".ccauth-tmp"
+        with open(tmp, "w") as f:
+            f.write(new)
+        os.replace(tmp, path)
+        if not quiet:
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), "codex config re-applied", flush=True)
+        return True
+    return False
+
+
+def codex_restore():
+    st = codex_state()
+    path = codex_config_path()
+    try:
+        with open(path) as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return
+    prov = _toml_get(lines, None, "model_provider") or "custom"
+    header = f"[model_providers.{prov}]"
+    if st.get("upstream") and (_toml_get(lines, header, "base_url") or "").rstrip("/") == CODEX_ROUTER_URL:
+        lines = _toml_set(lines, header, "base_url", st["upstream"])
+    if st.get("ccswitch_model") and _toml_get(lines, None, "model") == st["main"]:
+        lines = _toml_set(lines, None, "model", st["ccswitch_model"])
+    lines = _toml_del(lines, "[agents]", "default_subagent_model")
+    tmp = path + ".ccauth-tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines))
+    os.replace(tmp, path)
+
+
+# ---- the router ----
+
+def codex_neutralise(text):
+    text = re.sub(r"OpenAI Codex", "the coding agent", text)
+    text = re.sub(r"\bCodex\b", "the coding agent", text)
+    return re.sub(r"\bOpenAI\b", "the vendor", text)
+
+
+def codex_clean_for_relay(body):
+    if isinstance(body.get("instructions"), str):
+        body["instructions"] = codex_neutralise(body["instructions"])
+    for it in body.get("input") or []:
+        if isinstance(it, dict) and it.get("role") in ("developer", "system"):
+            for c in it.get("content") or []:
+                if isinstance(c, dict) and isinstance(c.get("text"), str):
+                    c["text"] = codex_neutralise(c["text"])
+    return body
+
+
+def codex_router():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    lock = threading.Lock()
+
+    def log(*a):
+        with lock:
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
+
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    proxied = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px} if px else {}))
+
+    def code_of(r):
+        return getattr(r, "status", None) or r.code
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def send_json(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path.startswith("/ccauth/health"):
+                return self.send_json(200, {"ok": True})
+            self.route(b"")
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            self.route(self.rfile.read(n) if n else b"")
+
+        def pipe(self, r):
+            self.send_response(code_of(r))
+            for k, v in r.headers.items():
+                if k.lower() not in ("content-length", "transfer-encoding", "connection", "content-encoding"):
+                    self.send_header(k, v)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            while True:
+                chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+
+        def open(self, opener, url, body, hdr):
+            req = urllib.request.Request(url, data=body if self.command == "POST" else None,
+                                         headers=hdr, method=self.command)
+            try:
+                return opener.open(req, timeout=1800)
+            except urllib.error.HTTPError as e:
+                return e
+
+        def route(self, body):
+            st = codex_state()
+            try:
+                j = json.loads(body) if body else {}
+            except ValueError:
+                j = {}
+            model = j.get("model") or ""
+            hdr = {k: v for k, v in self.headers.items()
+                   if k.lower() not in ("host", "content-length", "accept-encoding", "connection")}
+            try:
+                if model.lower().startswith("gemini"):
+                    return self.to_relay(st, j, hdr)
+                up = (st.get("upstream") or "").rstrip("/")
+                if not up:
+                    return self.send_json(502, {"error": {"message": "ccauth codex: no upstream recorded yet"}})
+                path = self.path[3:] if self.path.startswith("/v1") and up.endswith("/v1") else self.path
+                r = self.open(proxied, up + path, body, hdr)
+                log("upstream", self.command, self.path.split("?")[0], model or "-", code_of(r))
+                self.pipe(r)
+            except (BrokenPipeError, ConnectionResetError):
+                log("client closed", model)
+
+        def to_relay(self, st, j, hdr):
+            prov = _read_json(os.path.join(agy_provider_dir(), st["relay"] + ".json"))
+            if not prov:
+                return self.send_json(502, {"error": {"message": f"ccauth codex: relay {st['relay']} not found"}})
+            codex_clean_for_relay(j)
+            path = self.path[3:] if self.path.startswith("/v1") else self.path
+            models = [j["model"]] + [m for m in st.get("fallback_models") or [] if m != j["model"]]
+            chain = agy_chain(prov)
+            last = None
+            for pi, cand in enumerate(chain):
+                for mi, m in enumerate(models):
+                    j["model"] = m
+                    h = dict(hdr)
+                    h["Authorization"] = "Bearer " + cand["key"]
+                    r = self.open(direct, cand["url"].rstrip("/") + "/v1" + path, json.dumps(j).encode(), h)
+                    code = code_of(r)
+                    if code == 200:
+                        log("relay", cand["name"], m, 200)
+                        if agy_exhausted(cand["name"]):
+                            agy_mark_exhausted(cand["name"], False)
+                        return self.pipe(r)
+                    raw = r.read()
+                    last = (code, raw)
+                    low = raw.decode("utf-8", "replace").lower()
+                    log("relay", cand["name"], m, code, raw[:160])
+                    if agy_key_exhausted(code, raw):
+                        agy_mark_exhausted(cand["name"], True)
+                        break
+                    if code in (429, 503, 404) and any(w in low for w in
+                                                       ("cooling down", "exhausted", "no available channel",
+                                                        "model_not_found", "无可用渠道")):
+                        continue
+                    return self.send_json(code, json.loads(raw) if raw.startswith(b"{") else
+                                          {"error": {"message": raw[:300].decode("utf-8", "replace")}})
+            code, raw = last or (502, b'{"error":{"message":"ccauth codex: relay failed"}}')
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    log("codex router listening on", CODEX_PORT)
+    ThreadingHTTPServer(("127.0.0.1", CODEX_PORT), Handler).serve_forever()
+
+
+# ---- launchd ----
+
+def codex_plist(label):
+    return os.path.join(HOME, "Library", "LaunchAgents", label + ".plist")
+
+
+def codex_install(on):
+    uid = str(os.getuid())
+    for label in (CODEX_ROUTER_LABEL, CODEX_SYNC_LABEL):
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"], capture_output=True)
+        if not on and os.path.exists(codex_plist(label)):
+            os.remove(codex_plist(label))
+    if not on:
+        return
+    py = sys.executable or "/usr/bin/python3"
+    log = os.path.join(codex_store(), "router.log")
+    px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    common = (f"<key>EnvironmentVariables</key><dict><key>CCAUTH_HOME</key><string>{STORE}</string>"
+              f"<key>HTTPS_PROXY</key><string>{px}</string></dict>"
+              f"<key>StandardOutPath</key><string>{log}</string><key>StandardErrorPath</key><string>{log}</string>")
+    head = ('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>')
+    router = (f"{head}<key>Label</key><string>{CODEX_ROUTER_LABEL}</string>"
+              f"<key>ProgramArguments</key><array><string>{py}</string><string>{agy_script_path()}</string>"
+              f"<string>codex</string><string>router</string></array>"
+              f"<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>{common}</dict></plist>\n")
+    sync = (f"{head}<key>Label</key><string>{CODEX_SYNC_LABEL}</string>"
+            f"<key>ProgramArguments</key><array><string>{py}</string><string>{agy_script_path()}</string>"
+            f"<string>codex</string><string>sync</string></array>"
+            f"<key>WatchPaths</key><array><string>{codex_config_path()}</string></array>"
+            f"<key>RunAtLoad</key><true/>{common}</dict></plist>\n")
+    os.makedirs(os.path.dirname(codex_plist(CODEX_ROUTER_LABEL)), exist_ok=True)
+    for label, body in ((CODEX_ROUTER_LABEL, router), (CODEX_SYNC_LABEL, sync)):
+        with open(codex_plist(label), "w") as f:
+            f.write(body)
+        subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", codex_plist(label)], capture_output=True)
+
+
+def codex_router_alive():
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                f"http://127.0.0.1:{CODEX_PORT}/ccauth/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+# ---- commands ----
+
+def ccmd_on(main_model=None, relay=None):
+    if not agy_provider_names():
+        agy_die("Save a Gemini relay first: ccauth agy add <name> --url ... --key ...",
+                "先用 ccauth agy add 保存一个 Gemini 中转站")
+    st = codex_state()
+    if main_model:
+        st["main"] = main_model
+    if relay:
+        agy_provider(relay)
+        st["relay"] = relay
+    path = codex_config_path()
+    if os.path.exists(path):
+        bak = os.path.join(codex_store(), "config.toml.bak-" + time.strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(codex_store(), exist_ok=True)
+        with open(path) as src:
+            _write_private(bak, src.read())
+    st["enabled"] = True
+    codex_state_save(st)
+    codex_sync(quiet=True)
+    codex_install(True)
+    for _ in range(20):
+        if codex_router_alive():
+            break
+        time.sleep(0.25)
+    st = codex_state()
+    print(tt("Codex: main agent on the Gemini relay, subagents on the CC Switch provider.",
+             "Codex 已开启分流：主代理走 Gemini 中转站，子代理走 CC Switch 选中的服务商"))
+    ccmd_status(header=False)
+    print(tt("  Start a new Codex session (or restart the app) for it to take effect.",
+             "  新开 Codex 会话（或重启 Codex 应用）后生效"))
+
+
+def ccmd_off():
+    st = codex_state()
+    codex_install(False)
+    if st.get("enabled"):
+        codex_restore()
+    st["enabled"] = False
+    codex_state_save(st)
+    print(tt("Codex routing turned off; the config is back to what CC Switch wrote.",
+             "Codex 分流已关闭，配置恢复为 CC Switch 写入的原样"))
+
+
+def ccmd_set(key, value):
+    st = codex_state()
+    st[key] = value
+    codex_state_save(st)
+    if st.get("enabled"):
+        codex_sync(quiet=True)
+    label = {"subagent": tt("Subagent model", "子代理模型"), "main": tt("Main model", "主代理模型")}[key]
+    shown = (tt("follow CC Switch", "跟随 CC Switch") + f" ({st.get('ccswitch_model') or '?'})") \
+        if value == "follow" else value
+    print(f"{label}: {shown}")
+    print(tt("  Applies to new Codex sessions.", "  对新开的 Codex 会话生效"))
+
+
+def ccmd_status(header=True):
+    st = codex_state()
+    if header:
+        print(tt("Codex routing: ", "Codex 分流 ") + (tt("on", "开启") if st.get("enabled") else tt("off", "关闭")))
+    sub = st["subagent"]
+    if sub == "follow":
+        sub = tt("follow CC Switch", "跟随 CC Switch") + f"（{st.get('ccswitch_model') or '?'}）"
+    print(tt("  Main agent:  ", "  主代理   ") + f"{st['main']} @ {st['relay']}"
+          + tt(" (fallback ", "（冷却时改用 ") + ", ".join(st.get("fallback_models") or []) + tt(")", "）"))
+    print(tt("  Subagents:   ", "  子代理   ") + f"{sub} @ " + (st.get("upstream") or "?"))
+    print(tt("  CC Switch model: ", "  CC Switch 当前模型 ") + (st.get("ccswitch_model") or "?"))
+    print(tt("  Router:      ", "  本地分流 ") + (tt(f"running on {CODEX_ROUTER_URL}", f"运行中 {CODEX_ROUTER_URL}")
+                                                  if codex_router_alive() else tt("not running", "未运行")))
+
+
+CODEX_USAGE = {
+    "en": """ccauth {version} (codex) - Gemini main agent on a relay, subagents on the CC Switch provider
+
+Usage:
+  ccauth codex on [--main MODEL] [--relay NAME]   turn routing on (backs up ~/.codex/config.toml)
+  ccauth codex off                                restore the config CC Switch wrote
+  ccauth codex subagent <model|follow>            subagent model (default gpt-6.1-sol; follow = CC Switch's)
+  ccauth codex main <model>                       main agent model (default gemini-4-neon-xhigh)
+  ccauth codex status                             show the routing""",
+    "zh": """ccauth {version} (codex) - Codex 主代理走 Gemini 中转站，子代理走 CC Switch 选中的服务商
+
+用法
+  ccauth codex on [--main 模型] [--relay 名字]    开启分流（先备份 ~/.codex/config.toml）
+  ccauth codex off                                关闭分流，恢复 CC Switch 写入的配置
+  ccauth codex subagent <模型|follow>             子代理模型（默认 gpt-6.1-sol，follow 表示跟随 CC Switch）
+  ccauth codex main <模型>                        主代理模型（默认 gemini-4-neon-xhigh）
+  ccauth codex status                             查看分流状态""",
+}
+
+
+def codex_main(argv):
+    if not argv:
+        return ccmd_status()
+    cmd, rest = argv[0], list(argv[1:])
+    if cmd == "on":
+        ccmd_on(_opt(rest, "--main"), _opt(rest, "--relay"))
+    elif cmd == "off":
+        ccmd_off()
+    elif cmd in ("subagent", "sub") and len(rest) == 1:
+        ccmd_set("subagent", rest[0])
+    elif cmd == "main" and len(rest) == 1:
+        ccmd_set("main", rest[0])
+    elif cmd in ("status", "current"):
+        ccmd_status()
+    elif cmd == "sync":
+        codex_sync()
+    elif cmd == "router":
+        codex_router()
+    else:
+        print(CODEX_USAGE[LANG].format(version=VERSION))
+        sys.exit(0 if cmd in ("help", "--help", "-h") else 1)
+
+
 def main():
     argv = sys.argv[1:]
     if os.path.basename(sys.argv[0]) == "gauth":
@@ -2699,6 +3191,9 @@ def main():
         return
     if cmd == "agy":
         agy_main(rest)
+        return
+    if cmd == "codex":
+        codex_main(rest)
         return
     force = "--force" in rest or "-f" in rest
     rest = [a for a in rest if a not in ("--force", "-f")]
