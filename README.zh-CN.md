@@ -251,7 +251,7 @@ ccauth codex log -f                   # 实时查看请求：模型、去向、�
 ccauth codex off                      # 恢复 CC Switch 写入的配置
 ```
 
-开启后，配置里服务商的 `base_url` 指向本地分流，`model` 改为主代理模型，`[agents]` 写入 `default_subagent_model` 和 `default_subagent_reasoning_effort`。主代理派子代理时可以自己指定强度并覆盖这项配置，所以分流还会把每个子代理请求的 `reasoning.effort` 改成设定的强度，Codex 后台小模型 `gpt-6-luna` 的请求不改。服务商不接受这个强度时降一档重发，并记住 30 分钟。一个 LaunchAgent 监视配置文件，CC Switch 每次切换服务商重写文件后，它记下新的上游地址和模型并重新应用这些修改。
+开启后，配置里服务商的 `base_url` 指向本地分流，`model` 改为主代理模型，`[agents]` 写入 `default_subagent_model` 和 `default_subagent_reasoning_effort`。主代理派子代理时可以自己指定强度并覆盖这项配置，所以分流还会把 Codex 标记为派出子代理的请求（请求头 `x-openai-subagent: collab_spawn`）的 `reasoning.effort` 改成设定的强度。在 Codex 里直接选的模型和后台小模型 `gpt-6-luna` 不带这个标记，强度保持不变。服务商不接受这个强度时降一档重发，并记住 30 分钟。一个 LaunchAgent 监视配置文件，CC Switch 每次切换服务商重写文件后，它记下新的上游地址和模型并重新应用这些修改。在 Codex 里直接选的模型会被 Codex 写进配置，这种改动保持原样，请求按模型名分流，非 Gemini 模型发往 CC Switch 的服务商。
 
 有些中转站会拒绝自称 Codex 的系统提示，返回 429。发往 Gemini 中转站的请求中，developer、system 消息和 instructions 里的 Codex、OpenAI 字样会被替换为中性说法。主代理模型冷却或下架时依次改用 `gemini-4-hydrogen-xhigh`、`gemini-3.8-flash-high`，中转站 key 额度用完时沿用 `ccauth agy fallback` 的设置换 key。设置对新开的 Codex 会话生效。
 

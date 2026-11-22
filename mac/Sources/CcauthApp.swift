@@ -448,7 +448,7 @@ struct CodexView: View {
                 LabeledContent("CC Switch 当前模型") { Text(s.codex.ccswitch_model ?? "?") }
                 LabeledContent("CC Switch 当前服务商") { Text(s.codex.upstream ?? "?").foregroundStyle(.secondary).textSelection(.enabled) }
             } header: { Text("子代理（CC Switch 选中的公益站）") } footer: {
-                Text("每个子代理请求的思考强度都统一改成这里的值，主代理派子代理时指定的强度也会被覆盖，Codex 后台小模型除外。服务商不接受时自动降一档并记住 30 分钟。").font(.caption).foregroundStyle(.secondary)
+                Text("派出的子代理统一使用这里的思考强度，主代理派子代理时指定的强度也会被覆盖。在 Codex 里直接选的模型和后台小模型不受影响。服务商不接受时自动降一档并记住 30 分钟。").font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

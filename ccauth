@@ -2946,6 +2946,7 @@ CODEX_DEFAULTS = {"main": "gemini-4-neon-xhigh", "subagent": "gpt-6.1-sol", "rel
                   "fallback_models": ["gemini-4-hydrogen-xhigh", "gemini-3.8-flash-high"]}
 CODEX_EFFORTS = ("max", "xhigh", "high", "medium", "low")   # strongest first; an upstream refusal steps down
 CODEX_BACKGROUND = ("luna",)   # Codex's own background model keeps the effort Codex chose
+CODEX_SPAWN_HEADER = ("x-openai-subagent", "collab_spawn")   # what Codex sends for a spawned subagent
 
 
 def codex_effort(st):
@@ -3101,7 +3102,9 @@ def codex_write_catalog(st):
     return path
 
 
-def codex_sync(quiet=False):
+def codex_sync(quiet=False, force=False):
+    """Re-apply the routing. The model is reset to the main model only when CC Switch rewrote the
+    provider (base_url no longer points at the router) or force is set; a model picked in Codex stays."""
     st = codex_state()
     if not st.get("enabled"):
         return False
@@ -3116,17 +3119,18 @@ def codex_sync(quiet=False):
     header = f"[model_providers.{prov}]"
     base = _toml_get(lines, header, "base_url")
     changed_state = False
-    if base and base.rstrip("/") != CODEX_ROUTER_URL:
+    rewritten = bool(base) and base.rstrip("/") != CODEX_ROUTER_URL
+    if rewritten:
         if st.get("upstream") != base:
             st["upstream"] = base
             changed_state = True
         lines = _toml_set(lines, header, "base_url", CODEX_ROUTER_URL)
     model = _toml_get(lines, None, "model")
-    if model and model != st["main"] and not model.lower().startswith("gemini"):
+    if rewritten and model and model != st["main"] and not model.lower().startswith("gemini"):
         if st.get("ccswitch_model") != model:
             st["ccswitch_model"] = model
             changed_state = True
-    if model != st["main"]:
+    if (rewritten or force or not model) and model != st["main"]:
         lines = _toml_set(lines, None, "model", st["main"])
     sub = st.get("ccswitch_model") if st["subagent"] == "follow" else st["subagent"]
     if sub and _toml_get(lines, "[agents]", "default_subagent_model") != sub:
@@ -3378,7 +3382,8 @@ def codex_router():
             model = j.get("model") or ""
             rec = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "_t0": time.time(),
                    "path": self.path.split("?")[0], "asked": model, "model": model, "route": "", "tries": [],
-                   "ok": None, "status": None, "user": codex_user_text(j)[:200] if j else ""}
+                   "ok": None, "status": None, "user": codex_user_text(j)[:200] if j else "",
+                   "agent": self.headers.get(CODEX_SPAWN_HEADER[0]) or ""}
             hdr = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "content-length", "accept-encoding", "connection")}
             try:
@@ -3416,9 +3421,11 @@ def codex_router():
                                      f"当前服务商不支持 {model}，改用 {sub}")
                 else:
                     tries.append(sub)
-            # Subagent requests run at the configured effort, whatever the spawning agent asked for.
-            want = codex_effort(st) if (j and self.command == "POST" and "/responses" in path and not any(
-                b in (j.get("model") or "").lower() for b in CODEX_BACKGROUND)) else None
+            # Spawned subagents run at the configured effort, whatever the spawning agent asked for.
+            # A model picked in Codex itself carries no subagent header and keeps its own effort.
+            spawned = (self.headers.get(CODEX_SPAWN_HEADER[0]) or "") == CODEX_SPAWN_HEADER[1]
+            want = codex_effort(st) if (spawned and j and self.command == "POST" and "/responses" in path and
+                                        not any(b in (j.get("model") or "").lower() for b in CODEX_BACKGROUND)) else None
             if want:
                 rec["effort_asked"] = (j.get("reasoning") or {}).get("effort")
             dirty, i = False, 0
@@ -3560,7 +3567,9 @@ def codex_log_format(r):
     tok = ""
     if r.get("in_tokens") is not None:
         tok = f" {r.get('in_tokens')}/{r.get('out_tokens')} tok"
-    head = (f"{(r.get('ts') or '')[11:19]} {'OK ' if r.get('ok') else 'ERR'} {r.get('route') or '-':<10} "
+    agent = r.get("agent")
+    who = "" if not agent else (tt("subagent ", "子代理 ") if agent == CODEX_SPAWN_HEADER[1] else agent + " ")
+    head = (f"{(r.get('ts') or '')[11:19]} {'OK ' if r.get('ok') else 'ERR'} {r.get('route') or '-':<10} {who}"
             f"{r.get('asked') or '-'}" + (f" -> {r.get('model')}" if r.get("model") != r.get("asked") else "") +
             f"  {r.get('ms', 0) / 1000:.1f}s{tok}  [{tries}]")
     if r.get("effort"):
@@ -3678,7 +3687,7 @@ def ccmd_on(main_model=None, relay=None):
             _write_private(bak, src.read())
     st["enabled"] = True
     codex_state_save(st)
-    codex_sync(quiet=True)
+    codex_sync(quiet=True, force=True)
     codex_install(True)
     for _ in range(20):
         if codex_router_alive():
@@ -3716,7 +3725,7 @@ def ccmd_set(key, value):
     st[key] = value
     codex_state_save(st)
     if st.get("enabled"):
-        codex_sync(quiet=True)
+        codex_sync(quiet=True, force=(key == "main"))
     label = {"subagent": tt("Subagent model", "子代理模型"), "main": tt("Main model", "主代理模型"),
              "subagent_effort": tt("Subagent effort", "子代理强度")}[key]
     shown = (tt("follow CC Switch", "跟随 CC Switch") + f" ({st.get('ccswitch_model') or '?'})") \
@@ -3739,8 +3748,8 @@ def ccmd_status(header=True):
     print(tt("  Subagents:   ", "  子代理   ") + f"{sub} @ " + (st.get("upstream") or "?"))
     eff = codex_effort(st)
     print(tt("  Subagent effort: ", "  子代理强度 ") + (
-        tt(f"{eff} (every subagent request; Codex background calls excluded)",
-           f"{eff}（所有子代理请求统一使用，Codex 后台小模型除外）") if eff else tt("left to Codex", "交给 Codex 决定")))
+        tt(f"{eff} (every spawned subagent; models picked in Codex keep their own effort)",
+           f"{eff}（派出的子代理统一使用，在 Codex 里直接选的模型不受影响）") if eff else tt("left to Codex", "交给 Codex 决定")))
     print(tt("  CC Switch model: ", "  CC Switch 当前模型 ") + (st.get("ccswitch_model") or "?"))
     print(tt("  Router:      ", "  本地分流 ") + (tt(f"running on {CODEX_ROUTER_URL}", f"运行中 {CODEX_ROUTER_URL}")
                                                   if codex_router_alive() else tt("not running", "未运行")))
