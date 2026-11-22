@@ -173,6 +173,7 @@ class App:
         b = ttk.Frame(f)
         b.pack(fill="x", pady=8)
         ttk.Button(b, text="查询余额", command=self.load_quota).pack(side="left")
+        ttk.Button(b, text="更新可用模型", command=lambda: self.run(["agy", "models"])).pack(side="left", padx=6)
         ttk.Button(b, text="删除所选", command=lambda: self.selected(self.relay_tree) and self.run(
             ["agy", "rm", self.selected(self.relay_tree)],
             confirm=f"删除中转站 {self.selected(self.relay_tree)}？")).pack(side="left", padx=6)

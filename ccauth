@@ -1080,20 +1080,128 @@ def agy_session_file():
     return os.path.join(agy_store(), "official", "session")
 
 
-def agy_save_session(quiet=False):
+def agy_session_email(blob):
+    """The Google account inside a saved Antigravity session (go-keyring JSON)."""
+    if not blob:
+        return None
+    raw = blob.split(":", 1)[1] if blob.startswith("go-keyring-base64:") else blob
+    try:
+        obj = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)))
+    except Exception:
+        try:
+            obj = json.loads(blob)
+        except Exception:
+            return None
+    return obj.get("id_token_email") if isinstance(obj, dict) else None
+
+
+def agy_official_dir():
+    return os.path.join(agy_store(), "official", "profiles")
+
+
+def agy_official_names():
+    d = agy_official_dir()
+    if not os.path.isdir(d) and os.path.exists(agy_session_file()):
+        blob = _read_text(agy_session_file())
+        if blob:
+            agy_official_write("default", blob)
+    if not os.path.isdir(d):
+        return []
+    return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json"))
+
+
+def agy_official_read(name):
+    return _read_json(os.path.join(agy_official_dir(), name + ".json"))
+
+
+def agy_official_write(name, blob):
+    if not NAME_RE.match(name):
+        die("bad_name", name=name)
+    d = {"name": name, "email": agy_session_email(blob), "blob": blob,
+         "savedAt": datetime.now().astimezone().isoformat(timespec="seconds")}
+    _write_private(os.path.join(agy_official_dir(), name + ".json"), json.dumps(d, indent=2))
+    return d
+
+
+def agy_official_by_email(email):
+    for n in agy_official_names():
+        if email and (agy_official_read(n) or {}).get("email") == email:
+            return n
+    return None
+
+
+def agy_save_session(quiet=False, name=None):
     blob = agy_kc_read()
     if not blob:
         if quiet:
             return False
         agy_die("No Antigravity sign-in found in the keychain. Sign in with agy or the app first.",
                 "钥匙串里没有 Antigravity 登录态，请先在 agy 或桌面版里登录 Google 账号")
+    email = agy_session_email(blob)
+    if not name:
+        name = agy_official_by_email(email)
+    if not name:
+        name = "default"
+        if agy_official_read("default") and agy_official_read("default").get("email") != email:
+            local = re.sub(r"[^A-Za-z0-9._-]", "-", (email or "account").split("@")[0])[:40] or "account"
+            name = local
+    d = agy_official_write(name, blob)
     _write_private(agy_session_file(), blob)
     st = agy_state()
-    st["sessionSavedAt"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    st["sessionSavedAt"] = d["savedAt"]
+    st["official_profile"] = name
     agy_state_save(st)
     if not quiet:
-        print(tt("Saved the official Antigravity session.", "已保存官方 Antigravity 登录态"))
+        print(tt(f"Saved the official Antigravity session as {name} ({email or '?'}).",
+                 f"已保存官方 Antigravity 登录态为 {name}（{email or '?'}）"))
     return True
+
+
+def acmd_accounts():
+    live = agy_session_email(agy_kc_read()) if IS_MAC else None
+    names = agy_official_names()
+    if not names:
+        print(tt("No official accounts saved yet. Sign in, then run: ccauth agy save <name>",
+                 "还没有保存官方账号。登录后运行 ccauth agy save <名字>"))
+        return
+    for n in names:
+        d = agy_official_read(n) or {}
+        mark = "*" if live and d.get("email") == live else " "
+        print(f"{mark} {n:<12} {d.get('email') or '?':<34} {t('saved_at', ts=d.get('savedAt'))}")
+
+
+def acmd_forget(name):
+    path = os.path.join(agy_official_dir(), name + ".json")
+    if not os.path.exists(path):
+        die("not_found", name=name, have=", ".join(agy_official_names()) or t("none_saved"))
+    os.remove(path)
+    print(t("removed", name=name))
+
+
+def agy_switch_official_account(name):
+    """Put a saved Google session into the keychain, stashing the live one first."""
+    target = agy_official_read(name)
+    if not target:
+        die("not_found", name=name, have=", ".join(agy_official_names()) or t("none_saved"))
+    live = agy_kc_read()
+    live_email = agy_session_email(live)
+    if live and live_email and live_email != target.get("email"):
+        other = agy_official_by_email(live_email)
+        if other and other != name:
+            agy_official_write(other, live)
+            print(t("restashed", name=other))
+    agy_kc_write(target["blob"])
+    _write_private(agy_session_file(), target["blob"])
+    cache = agy_cache_dir()
+    if os.path.isdir(cache):
+        for f in os.listdir(cache):
+            if f.endswith(".json"):
+                os.remove(os.path.join(cache, f))
+    st = agy_state()
+    st["official_profile"] = name
+    agy_state_save(st)
+    print(tt(f"Google account: {name} ({target.get('email') or '?'})",
+             f"官方账号已换成 {name}（{target.get('email') or '?'}）"))
 
 
 # ---- installation ids ------------------------------------------------------
@@ -2184,6 +2292,10 @@ def agy_checkin_all(names=None, force_all=False):
             msg = f"{n}: " + tt("check-in failed: ", "签到失败：") + str(e)
             rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": "error", "error": str(e)}
         print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+    try:
+        agy_refresh_all_models()
+    except Exception:
+        pass
     st = agy_state()
     st["checkin"] = rec
     agy_state_save(st)
@@ -2307,9 +2419,9 @@ def acmd_add(name, url, key, models=None, default=None, force=False):
     print(tt(f"  Switch with: ccauth agy use {name}", f"  切换命令 ccauth agy use {name}"))
 
 
-def acmd_use(name):
+def acmd_use(name, account=None):
     if name == "official":
-        return acmd_use_official()
+        return acmd_use_official(account)
     prov = agy_provider(name)
     if not IS_MAC:
         agy_die("Third-party mode for Antigravity is implemented for macOS only.",
@@ -2337,7 +2449,9 @@ def acmd_use(name):
     agy_restart_note(hooked)
 
 
-def acmd_use_official():
+def acmd_use_official(account=None):
+    if account:
+        agy_switch_official_account(account)
     agy_service_stop()
     agy_ids_apply("official")
     agy_cli_model_provider(False)
@@ -2498,6 +2612,50 @@ def agy_quota_lines():
     return out
 
 
+def agy_refresh_all_models(names=None):
+    """Re-read every saved relay's model list now. Returns {name: (added, removed, models, error)}."""
+    out = {}
+    for n in names or agy_provider_names():
+        prov = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}
+        if not prov:
+            continue
+        before = list(prov.get("models") or [])
+        try:
+            after = agy_fetch_models(prov["url"], prov["key"])
+            err = None
+        except Exception as e:  # noqa: BLE001
+            after, err = before, str(e)
+        if after and not err:
+            disk = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}
+            disk["models"] = after
+            disk["models_checked_at"] = time.time()
+            _write_private(os.path.join(agy_provider_dir(), n + ".json"), json.dumps(disk, indent=2))
+        out[n] = ([m for m in after if m not in before], [m for m in before if m not in after], after, err)
+    try:
+        if codex_state().get("enabled"):
+            codex_sync(quiet=True)
+    except Exception:
+        pass
+    return out
+
+
+def acmd_models(names):
+    res = agy_refresh_all_models(names or None)
+    if not res:
+        agy_die("No relays saved yet.", "还没有保存任何第三方")
+    for n, (added, removed, models, err) in res.items():
+        if err:
+            print(f"{n}: " + tt("could not read the model list: ", "读取模型列表失败：") + err)
+            continue
+        change = []
+        if added:
+            change.append(tt("new ", "新增 ") + ", ".join(added))
+        if removed:
+            change.append(tt("withdrawn ", "下架 ") + ", ".join(removed))
+        print(f"{n}: " + (("，" if LANG == "zh" else ", ").join(change) if change else tt("no change", "没有变化")))
+        print("  " + tt("models: ", "可用模型 ") + ", ".join(models))
+
+
 def acmd_quota():
     if not agy_provider_names():
         agy_die("No relays saved yet.", "还没有保存任何第三方")
@@ -2587,7 +2745,9 @@ Usage:
   ccauth agy add <name> --url URL --key KEY [--models a,b] [--default m] [--force]
                                     save a Gemini-compatible relay; models are read from /v1/models
   ccauth agy use <name>             switch agy and the desktop app to that relay
-  ccauth agy use official           switch back to the Google sign-in
+  ccauth agy use official [account] switch back to the Google sign-in, optionally to a saved account
+  ccauth agy accounts               list saved Google accounts, * marks the signed-in one
+  ccauth agy forget <account>       delete a saved Google account
   ccauth agy cheap <name> <model|off>
                                     send tool-result steps to a cheaper model (first call keeps yours);
                                     a question that starts with @h uses the cheaper model throughout,
@@ -2597,6 +2757,7 @@ Usage:
   ccauth agy hint <name> <on|off|text>
                                     append a request-saving note to the system prompt
   ccauth agy quota                  show the remaining balance of every saved relay key
+  ccauth agy models [name]          re-read the relays' model lists now (also done every 15 minutes)
   ccauth agy login <name> <username>
                                     log in to the relay account behind a key (password saved locally, mode 600)
   ccauth agy checkin [name] [--install|--uninstall]
@@ -2607,7 +2768,7 @@ Usage:
                                     steps the model marks as writing run on this model
   ccauth agy fallback <name> <other|off>
                                     when the key runs out or expires, switch to another relay until midnight
-  ccauth agy save                   save the current Google session (done automatically on first switch)
+  ccauth agy save [account]         save the signed-in Google session under a name (default: by email)
   ccauth agy list                   list official + saved relays, * marks the active one
   ccauth agy status                 show the active mode
   ccauth agy rm <name>              delete a relay
@@ -2620,7 +2781,9 @@ Restart agy and the desktop app after switching.""",
   ccauth agy add <名字> --url 地址 --key 密钥 [--models a,b] [--default 模型] [--force]
                                     保存一个 Gemini 兼容的中转站，模型列表自动从 /v1/models 读取
   ccauth agy use <名字>             把 agy 和桌面版切到该中转站
-  ccauth agy use official           切回官方 Google 登录
+  ccauth agy use official [账号]    切回官方 Google 登录，可指定已保存的账号
+  ccauth agy accounts               列出已保存的 Google 官方账号，* 标记当前登录的
+  ccauth agy forget <账号>          删除一个已保存的官方账号
   ccauth agy cheap <名字> <模型|off>
                                     带工具结果的步骤改用便宜模型，每个问题的第一次调用仍用所选模型
                                     以 @h 开头的问题从头到尾都用便宜模型
@@ -2630,6 +2793,7 @@ Restart agy and the desktop app after switching.""",
   ccauth agy hint <名字> <on|off|文本>
                                     在系统提示末尾追加省调用提示词，也可以给自定义文本
   ccauth agy quota                  查看每个已保存 key 的剩余额度
+  ccauth agy models [名字]          立即更新中转站的可用模型（后台也会每 15 分钟更新）
   ccauth agy login <名字> <用户名>   登录 key 所属的中转站账户（密码存在本机，权限 600）
   ccauth agy checkin [名字] [--install|--uninstall]
                                     立即签到，或设置每天定时自动签到
@@ -2639,7 +2803,7 @@ Restart agy and the desktop app after switching.""",
                                     模型标记为写作的步骤改用这个模型
   ccauth agy fallback <名字> <备用名字|off>
                                     key 额度用完或失效时自动改用另一个，到当天零点再换回
-  ccauth agy save                   保存当前官方登录态（第一次切走时会自动保存）
+  ccauth agy save [账号]            把当前登录的 Google 账号存成一个档案（不写名字时按邮箱识别）
   ccauth agy list                   列出官方与已保存的中转站，* 标记当前
   ccauth agy status                 显示当前模式
   ccauth agy rm <名字>              删除一个中转站
@@ -2679,9 +2843,18 @@ def agy_main(argv):
         acmd_add(rest[0], url, key, [m.strip() for m in models.split(",")] if models else None,
                  default, force)
     elif cmd == "use":
-        if len(rest) != 1:
+        if len(rest) == 2 and rest[0] == "official":
+            acmd_use(rest[0], rest[1])
+        elif len(rest) != 1:
             die("needs_arg", cmd="agy use")
-        acmd_use(rest[0])
+        else:
+            acmd_use(rest[0])
+    elif cmd in ("accounts", "officials"):
+        acmd_accounts()
+    elif cmd == "forget":
+        if len(rest) != 1:
+            die("needs_arg", cmd="agy forget")
+        acmd_forget(rest[0])
     elif cmd in ("rm", "remove"):
         if len(rest) != 1:
             die("needs_arg", cmd="agy rm")
@@ -2712,6 +2885,8 @@ def agy_main(argv):
         else:
             sys.exit(0 if agy_checkin_all([a for a in rest if not a.startswith("-")] or None,
                                           force_all=bool([a for a in rest if not a.startswith("-")])) else 1)
+    elif cmd in ("models", "refresh"):
+        acmd_models([a for a in rest if not a.startswith("-")])
     elif cmd in ("quota", "balance"):
         if "--json" in rest:
             gui_print_quota()
@@ -2730,7 +2905,7 @@ def agy_main(argv):
             die("needs_arg", cmd="agy hint <name> <on|off|text>")
         acmd_hint(rest[0], rest[1])
     elif cmd == "save":
-        agy_save_session()
+        agy_save_session(name=rest[0] if rest else None)
     elif cmd in ("list", "ls"):
         acmd_list()
     elif cmd in ("status", "current"):
@@ -3294,6 +3469,17 @@ def codex_router():
             self.end_headers()
             self.wfile.write(raw)
 
+    def refresher():
+        while True:
+            try:
+                for n, (added, removed, _m, err) in agy_refresh_all_models().items():
+                    if added or removed:
+                        log("models", n, "added", added, "removed", removed)
+            except Exception as e:  # noqa: BLE001
+                log("model refresh failed", repr(e))
+            time.sleep(AGY_MODELS_TTL)
+
+    threading.Thread(target=refresher, daemon=True).start()
     log("codex router listening on", CODEX_PORT)
     ThreadingHTTPServer(("127.0.0.1", CODEX_PORT), Handler).serve_forever()
 
@@ -3600,6 +3786,7 @@ def gui_state():
         "claude": {"current": here, "profiles": claude},
         "gemini": {"current": gactive, "profiles": gem},
         "agy": {"active": st.get("active", "official"), "bridge": agy_bridge_alive(),
+                "officials": gui_officials(),
                 "session_saved": os.path.exists(agy_session_file()), "providers": provs, "sites": sites},
         "checkin": {"records": st.get("checkin") or {}, "scheduled": checkin_scheduled()},
         "codex": {"enabled": bool(cs.get("enabled")), "main": cs.get("main"), "subagent": cs.get("subagent"),
@@ -3607,6 +3794,16 @@ def gui_state():
                   "ccswitch_model": cs.get("ccswitch_model"), "fallback_models": cs.get("fallback_models"),
                   "router": codex_router_alive()},
     }
+
+
+def gui_officials():
+    live = agy_session_email(agy_kc_read()) if IS_MAC else None
+    out = []
+    for n in agy_official_names():
+        d = agy_official_read(n) or {}
+        out.append({"name": n, "email": d.get("email"), "savedAt": d.get("savedAt"),
+                    "current": bool(live) and d.get("email") == live})
+    return out
 
 
 def gui_quota():

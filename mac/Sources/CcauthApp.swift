@@ -28,9 +28,18 @@ struct Profile: Decodable, Identifiable {
     var id: String { name }
 }
 
+struct OfficialAccount: Decodable, Identifiable {
+    var name: String
+    var email: String?
+    var savedAt: String?
+    var current: Bool
+    var id: String { name }
+}
+
 struct Agy: Decodable {
     var active: String
     var bridge: Bool
+    var officials: [OfficialAccount]?
     var session_saved: Bool
     var providers: [Provider]
     var sites: [Site]
@@ -246,9 +255,44 @@ struct AgyView: View {
     @State private var newName = ""
     @State private var newURL = ""
     @State private var newKey = ""
+    @State private var accountName = ""
 
     var body: some View {
         Form {
+            Section {
+                let list = s.agy.officials ?? []
+                if list.isEmpty {
+                    Text("还没有保存的官方账号。在 Antigravity 里登录 Google 账号后，在下面起个名字保存。").foregroundStyle(.secondary)
+                }
+                ForEach(list) { a in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(a.name).font(.headline)
+                            Text(a.email ?? "?").foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(shortTime(a.savedAt)).font(.caption).foregroundStyle(.secondary)
+                        if a.current && s.agy.active == "official" {
+                            Tag(text: "使用中")
+                        } else if a.current {
+                            Tag(text: "已登录")
+                        }
+                        Button(a.current && s.agy.active == "official" ? "保持" : "切换到这个账号") {
+                            store.run(["agy", "use", "official", a.name], confirm: "切换到官方账号 \(a.name)（\(a.email ?? "")）？切换后要完全退出 Antigravity 再打开。")
+                        }
+                        .disabled(a.current && s.agy.active == "official")
+                        Button("删除", role: .destructive) { store.run(["agy", "forget", a.name], confirm: "删除已保存的账号 \(a.name)？") }
+                    }
+                }
+                HStack {
+                    TextField("保存当前登录的账号为", text: $accountName, prompt: Text("名字，如 work"))
+                    Button("保存") { store.run(["agy", "save", accountName]); accountName = "" }
+                        .disabled(accountName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                Text("要再加一个账号：在 Antigravity 里退出并登录另一个 Google 账号，回到这里起个名字保存。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("Google 官方账号") }
+
             Section {
                 LabeledContent("当前模式") {
                     Tag(text: s.agy.active == "official" ? "官方 Google 登录" : "第三方 \(s.agy.active)")
@@ -256,7 +300,7 @@ struct AgyView: View {
                 LabeledContent("本地桥") { StatusDot(on: s.agy.bridge, onText: "运行中", offText: "未运行") }
                 LabeledContent("官方登录态") { Text(s.agy.session_saved ? "已保存" : "未保存").foregroundStyle(.secondary) }
                 HStack {
-                    Button("保存官方登录态") { store.run(["agy", "save"]) }
+                    Button("更新当前账号的登录态") { store.run(["agy", "save"]) }
                     Button("切回官方") { store.run(["agy", "use", "official"]) }
                         .disabled(s.agy.active == "official")
                     Spacer()
@@ -270,6 +314,7 @@ struct AgyView: View {
                 HStack {
                     Text("第三方中转站")
                     Spacer()
+                    Button("全部更新模型") { store.run(["agy", "models"]) }
                     Button(store.quotaLoading ? "查询中…" : "查询余额") { store.loadQuota() }
                         .disabled(store.quotaLoading)
                 }
@@ -319,6 +364,7 @@ struct ProviderRow: View {
                 } else {
                     Button("切换到这里") { store.run(["agy", "use", p.name]) }.buttonStyle(.borderedProminent)
                 }
+                Button("更新模型") { store.run(["agy", "models", p.name]) }
                 Button("删除", role: .destructive) { store.run(["agy", "rm", p.name], confirm: "删除中转站 \(p.name)？") }
             }
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
@@ -342,7 +388,7 @@ struct ProviderRow: View {
                                                      set: { store.run(["agy", "hint", p.name, $0 ? "on" : "off"]) }))
                 }
             }
-            Text("可用模型：" + p.models.joined(separator: "，")).font(.caption).foregroundStyle(.secondary)
+            Text("可用模型：" + p.models.joined(separator: "，") + "（后台每 15 分钟自动更新）").font(.caption).foregroundStyle(.secondary)
         }
         .padding(.vertical, 4)
     }
@@ -370,7 +416,12 @@ struct CodexView: View {
                                                    set: { store.run(["codex", "main", $0]) })) {
                     ForEach(pickerOptions(relayModels, current: s.codex.main, off: nil), id: \.0) { Text($0.1).tag($0.0) }
                 }
-                LabeledContent("主代理中转站") { Text(s.codex.relay ?? "?") }
+                LabeledContent("主代理中转站") {
+                    HStack {
+                        Text(s.codex.relay ?? "?")
+                        Button("更新可用模型") { store.run(["agy", "models"]) }
+                    }
+                }
                 LabeledContent("冷却时改用") { Text((s.codex.fallback_models ?? []).joined(separator: "、")).foregroundStyle(.secondary) }
             } header: { Text("主代理（Gemini）") } footer: {
                 Text("设置对新开的 Codex 会话生效。").font(.caption).foregroundStyle(.secondary)

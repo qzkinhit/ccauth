@@ -158,7 +158,10 @@ gauth work
 `ccauth agy` switches Antigravity (the `agy` CLI and the desktop app) between the Google sign-in and a third-party Gemini-compatible relay.
 
 ```sh
-ccauth agy save                                  # save the current Google session
+ccauth agy save work                             # save the signed-in Google account as work
+ccauth agy accounts                              # list saved Google accounts
+ccauth agy use official work                     # back to the Google sign-in, as the work account
+ccauth agy models                                # re-read the relays' model lists (also every 15 minutes)
 ccauth agy add relay --url https://relay.example.com --key sk-xxxx
 ccauth agy use relay                             # switch to the relay
 ccauth agy use official                          # switch back to the Google sign-in

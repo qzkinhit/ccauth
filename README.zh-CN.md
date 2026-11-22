@@ -158,7 +158,10 @@ gauth work
 `ccauth agy` 让 Antigravity（命令行 `agy` 与桌面版）在官方 Google 登录和第三方 Gemini 兼容中转站之间切换。
 
 ```sh
-ccauth agy save                                  # 保存当前的官方登录态
+ccauth agy save work                             # 把当前登录的 Google 账号存为 work
+ccauth agy accounts                              # 列出已保存的官方账号
+ccauth agy use official work                     # 切回官方并换成 work 账号
+ccauth agy models                                # 立即更新中转站的可用模型（后台每 15 分钟也会更新）
 ccauth agy add relay --url https://relay.example.com --key sk-xxxx
 ccauth agy use relay                             # 切到中转站
 ccauth agy use official                          # 切回官方登录
