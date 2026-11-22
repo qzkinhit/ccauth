@@ -262,6 +262,10 @@ cd mac
 
 Building needs the Xcode Command Line Tools (`xcode-select --install`); the app needs macOS 14 or later. It uses `~/.local/bin/ccauth` when present and the copy bundled inside the app otherwise.
 
+## Windows
+
+The Windows package holds `ccauth-gui.exe` (window app) and `ccauth.exe` (command line), built with PyInstaller on GitHub Actions and smoke-tested on Windows before each release. On Windows you get Claude and Gemini CLI accounts, relay management and balances, and daily check-in (Task Scheduler at 00:10 and 12:10). Antigravity third-party mode and Codex routing are macOS only.
+
 ## Files
 
 | Path | Contents |

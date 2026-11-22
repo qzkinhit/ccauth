@@ -232,6 +232,14 @@ def pick_lang():
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
         if "zh" in os.environ.get(var, "").lower():
             return "zh"
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            if lang_id & 0x3FF == 0x04:  # LANG_CHINESE
+                return "zh"
+        except Exception:
+            pass
     if platform.system() == "Darwin":
         try:
             out = subprocess.run(["defaults", "read", "-g", "AppleLocale"],
@@ -1176,6 +1184,13 @@ def agy_install_hook():
 
 def agy_script_path():
     return os.path.realpath(sys.argv[0])
+
+
+def self_command():
+    """How to start this program again: the frozen exe, or the interpreter plus this script."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable or "python3", agy_script_path()]
 
 
 def agy_service_start():
@@ -2175,7 +2190,40 @@ def agy_checkin_all(names=None, force_all=False):
     return ok
 
 
+IS_WIN = platform.system() == "Windows"
+WIN_TASKS = (("ccauth-checkin-0010", "00:10"), ("ccauth-checkin-1210", "12:10"))
+
+
+def checkin_scheduled():
+    if IS_WIN:
+        r = subprocess.run(["schtasks", "/Query", "/TN", WIN_TASKS[0][0]], capture_output=True)
+        return r.returncode == 0
+    return os.path.exists(agy_checkin_plist())
+
+
+def agy_checkin_install_windows(on):
+    for name, _ in WIN_TASKS:
+        subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"], capture_output=True)
+    if not on:
+        print(tt("Daily check-in schedule removed.", "已取消每日自动签到"))
+        return
+    cmd = subprocess.list2cmdline(self_command() + ["agy", "checkin"])
+    for name, at in WIN_TASKS:
+        r = subprocess.run(["schtasks", "/Create", "/SC", "DAILY", "/TN", name, "/TR", cmd, "/ST", at, "/F"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            agy_die("Task Scheduler refused the task: " + (r.stderr or r.stdout).strip(),
+                    "任务计划程序拒绝创建任务：" + (r.stderr or r.stdout).strip())
+    print(tt("Daily check-in scheduled at 00:10 and 12:10 (Task Scheduler).",
+             "已设置每日自动签到，时间为 00:10 与 12:10（任务计划程序）"))
+
+
 def agy_checkin_install(on):
+    if IS_WIN:
+        return agy_checkin_install_windows(on)
+    if not IS_MAC:
+        agy_die("Scheduling is implemented for macOS and Windows; use cron on Linux.",
+                "定时签到支持 macOS 与 Windows，Linux 请用 cron")
     uid = str(os.getuid())
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGY_CHECKIN_LABEL}"], capture_output=True)
     if not on:
@@ -2225,7 +2273,7 @@ def agy_status_checkin():
         if r.get("balance") is not None:
             line = f"{line:<16}" + tt("  balance after check-in ", "  签到后余额 ") + f"${r['balance']:.2f}"
         print(f"  {n:<12} {line}")
-    sched = os.path.exists(agy_checkin_plist())
+    sched = checkin_scheduled()
     print("  " + (tt("schedule: on", "自动签到 已开启") if sched else tt("schedule: off", "自动签到 未开启")))
 
 
@@ -3077,6 +3125,8 @@ def codex_router_alive():
 # ---- commands ----
 
 def ccmd_on(main_model=None, relay=None):
+    if not IS_MAC:
+        agy_die("Codex routing is implemented for macOS only.", "Codex 分流目前只支持 macOS")
     if not agy_provider_names():
         agy_die("Save a Gemini relay first: ccauth agy add <name> --url ... --key ...",
                 "先用 ccauth agy add 保存一个 Gemini 中转站")
@@ -3249,11 +3299,12 @@ def gui_state():
     cs = codex_state()
     return {
         "version": VERSION,
+        "platform": platform.system(),
         "claude": {"current": here, "profiles": claude},
         "gemini": {"current": gactive, "profiles": gem},
         "agy": {"active": st.get("active", "official"), "bridge": agy_bridge_alive(),
                 "session_saved": os.path.exists(agy_session_file()), "providers": provs, "sites": sites},
-        "checkin": {"records": st.get("checkin") or {}, "scheduled": os.path.exists(agy_checkin_plist())},
+        "checkin": {"records": st.get("checkin") or {}, "scheduled": checkin_scheduled()},
         "codex": {"enabled": bool(cs.get("enabled")), "main": cs.get("main"), "subagent": cs.get("subagent"),
                   "relay": cs.get("relay"), "upstream": cs.get("upstream"),
                   "ccswitch_model": cs.get("ccswitch_model"), "fallback_models": cs.get("fallback_models"),
@@ -3279,6 +3330,13 @@ def gui_print_quota():
 
 
 def main():
+    if platform.system() == "Windows":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if not stream.isatty():
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     argv = sys.argv[1:]
     if os.path.basename(sys.argv[0]) == "gauth":
         gemini_main(argv)

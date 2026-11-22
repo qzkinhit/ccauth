@@ -262,6 +262,10 @@ cd mac
 
 构建需要 Xcode Command Line Tools（`xcode-select --install`），运行需要 macOS 14 或更高版本。软件优先使用 `~/.local/bin/ccauth`，找不到时使用打包在软件里的副本。
 
+## Windows
+
+Windows 包包含 `ccauth-gui.exe`（窗口程序）与 `ccauth.exe`（命令行），由 GitHub Actions 在 Windows 上用 PyInstaller 编译，并在发布前自动运行冒烟测试。Windows 上可用 Claude 与 Gemini CLI 多账号、中转站管理与余额、每日签到（任务计划程序在 00:10 与 12:10 运行）。Antigravity 第三方模式与 Codex 分流只在 macOS 上提供。
+
 ## 文件位置
 
 | 路径 | 内容 |

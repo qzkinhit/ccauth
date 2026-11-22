@@ -1,0 +1,74 @@
+name: windows-package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the package to (empty: build and keep as an artifact only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build ccauth.exe and ccauth-gui.exe
+        shell: pwsh
+        run: |
+          Copy-Item ccauth ccauth_cli.py
+          pyinstaller --onefile --console --name ccauth ccauth_cli.py
+          pyinstaller --onefile --windowed --name ccauth-gui windows/ccauth_gui.py
+
+      - name: Smoke test
+        shell: pwsh
+        env:
+          CCAUTH_HOME: ${{ runner.temp }}\ccauth-home
+          CCAUTH_LANG: zh
+        run: |
+          dist\ccauth.exe version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -c "import subprocess,json; o=subprocess.run(['dist/ccauth.exe','state'],capture_output=True,check=True).stdout; d=json.loads(o.decode('utf-8')); print('state ok', d['platform'], d['version'])"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          dist\ccauth.exe agy checkin --install
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          schtasks /Query /TN ccauth-checkin-0010
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          dist\ccauth.exe agy checkin --uninstall
+          $p = Start-Process -FilePath dist\ccauth-gui.exe -ArgumentList '--selftest' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { Write-Error "GUI selftest failed ($($p.ExitCode))"; exit 1 }
+          Write-Output "GUI selftest ok"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item dist\ccauth.exe, dist\ccauth-gui.exe, LICENSE pkg\
+          Copy-Item windows\README-windows.txt pkg\README.txt
+          Compress-Archive -Path pkg\* -DestinationPath ccauth-windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ccauth-windows-x64
+          path: ccauth-windows-x64.zip
+
+      - name: Attach to release
+        if: github.event_name == 'release' || inputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$env:TAG" ccauth-windows-x64.zip --clobber
