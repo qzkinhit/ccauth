@@ -3797,7 +3797,10 @@ def gui_state():
 
 
 def gui_officials():
-    live = agy_session_email(agy_kc_read()) if IS_MAC else None
+    # The keychain is not read here: Antigravity reads the same item with a short timeout,
+    # and polling it from a panel makes the app stall. The last saved or switched account is used.
+    cur = agy_state().get("official_profile")
+    live = (agy_official_read(cur) or {}).get("email") if cur else None
     out = []
     for n in agy_official_names():
         d = agy_official_read(n) or {}

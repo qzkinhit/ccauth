@@ -701,7 +701,7 @@ struct CodexLogView: View {
             await load()
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if live { await load() }
+                if live && NSApplication.shared.isActive { await load() }
             }
         }
     }
@@ -804,8 +804,8 @@ struct ContentView: View {
         .task {
             await store.refresh()
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 20_000_000_000)
-                if !store.busy { await store.refresh() }
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                if !store.busy && NSApplication.shared.isActive { await store.refresh() }
             }
         }
     }
