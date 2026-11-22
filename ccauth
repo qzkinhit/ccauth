@@ -3028,7 +3028,8 @@ def codex_user_text(body):
     return ""
 
 
-CODEX_ALIASES = {"gpt-6-luna": "@subagent"}
+CODEX_ALIASES = {}
+CODEX_UNSUPPORTED_SECONDS = 1800
 CODEX_COOLDOWN_SECONDS = 180
 
 
@@ -3038,6 +3039,7 @@ def codex_router():
 
     lock = threading.Lock()
     cooled = {}
+    unsupported = {}
 
     def log(*a):
         with lock:
@@ -3201,7 +3203,12 @@ def codex_router():
             tries = [model] if model else [""]
             sub = sub_model(st)
             if sub and model and sub != model:
-                tries.append(sub)
+                if unsupported.get((up, model), 0) > time.time():
+                    tries = [sub]
+                    rec["note"] = tt(f"{model} is not offered by this provider; using {sub}",
+                                     f"当前服务商不支持 {model}，改用 {sub}")
+                else:
+                    tries.append(sub)
             for i, m in enumerate(tries):
                 if m and m != j.get("model"):
                     j["model"] = m
@@ -3210,10 +3217,13 @@ def codex_router():
                 code = code_of(r)
                 rec["tries"].append([m or "-", code])
                 rec["model"], rec["status"] = m, code
-                if code == 404 and i + 1 < len(tries):
+                if code in (400, 404) and i + 1 < len(tries):
                     raw = r.read()
-                    if b"model" in raw.lower():
-                        log("upstream", m, 404, "-> retry with", tries[i + 1])
+                    low = raw.lower()
+                    if m.encode() in raw or b"model" in low or "模型".encode() in raw:
+                        unsupported[(up, m)] = time.time() + CODEX_UNSUPPORTED_SECONDS
+                        rec["note"] = raw[:200].decode("utf-8", "replace")
+                        log("upstream", m, code, "not offered -> retry with", tries[i + 1])
                         continue
                     rec["error"] = raw[:300].decode("utf-8", "replace")
                     return self.send_json(404, json.loads(raw) if raw.startswith(b"{") else {"error": {"message": rec["error"]}})
@@ -3317,6 +3327,8 @@ def codex_log_format(r):
         lines.append("    " + tt("asked: ", "提问：") + r["user"].replace("\n", " ")[:160])
     if r.get("reply"):
         lines.append("    " + tt("reply: ", "回复：") + r["reply"].replace("\n", " ")[:160])
+    if r.get("note"):
+        lines.append("    " + tt("note: ", "说明：") + r["note"].replace("\n", " ")[:200])
     if r.get("error") and not r.get("ok"):
         lines.append("    " + tt("error: ", "错误：") + r["error"].replace("\n", " ")[:200])
     return "\n".join(lines)
