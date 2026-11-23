@@ -266,6 +266,7 @@ ccauth collab status                  # 开关、写作模型、今天的调用�
 ccauth collab review a.tex b.tex -o review.md     # 全部文件一次发出，返回 Markdown 审读意见
 ccauth collab explain STATUS.md -o summary.md     # 把执行代理的汇报翻译成人话
 ccauth collab ideas context.md -o ideas.md --search   # 出 idea 与优化方向，--search 联网检索
+ccauth collab lead claude                         # 主模型：claude（默认）或 codex（Codex 主代理决策，子代理执行）
 ccauth collab executor gpt-6.1-sol,gpt-6-astra    # 执行代理及备选
 ccauth collab writers gemini-4-neon-xhigh,gemini-4-argon-high   # 写作模型顺序
 ccauth collab model gemini-4-neon-xhigh           # 换写作模型；provider <名字> 换中转站

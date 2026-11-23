@@ -266,6 +266,7 @@ ccauth collab status                  # switch, writing model, requests today
 ccauth collab review a.tex b.tex -o review.md     # all files in one request, Markdown review back
 ccauth collab explain STATUS.md -o summary.md     # plain-language summary of an executor report
 ccauth collab ideas context.md -o ideas.md --search   # ideas and optimization directions, --search for recent work
+ccauth collab lead claude                         # lead model: claude (default) or codex (the Codex main agent leads, subagents execute)
 ccauth collab executor gpt-6.1-sol,gpt-6-astra    # executor and alternatives
 ccauth collab writers gemini-4-neon-xhigh,gemini-4-argon-high   # writer order
 ccauth collab model gemini-4-neon-xhigh           # change the writing model; provider <name> changes the relay

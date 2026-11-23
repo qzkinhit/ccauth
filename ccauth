@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 RESERVED = {"save", "use", "list", "ls", "status", "current", "rm", "remove",
             "help", "version", "path", "gemini", "agy", "official", "codex", "state", "collab"}
@@ -3831,13 +3831,14 @@ COLLAB_DEFAULT_MODEL = "gemini-4-neon-xhigh"
 COLLAB_DEFAULT_WRITER_ALT = ["gemini-4-argon-high", "gemini-4-hydrogen-xhigh"]
 COLLAB_DEFAULT_EXECUTOR = "gpt-6.1-sol"
 COLLAB_DEFAULT_EXECUTOR_ALT = ["gpt-6-astra"]
+COLLAB_LEADS = ("claude", "codex")
 
 COLLAB_CLAUDE_ZH = """## 协作模式（由 ccauth collab 开启，关闭时本节自动删除）
 
 分工：两个模型给你打下手，你做决策，最终向用户汇报并对用户负责。
 - 执行代理（Codex，当前 {executor}，备选 {exec_alt}）是生产力模型。写代码和审核能力强，负责实验脚本、参数搜索与调优、跑实验、收集结果和审计。它的短处是不说人话、过度防御谨慎、汇报避重就轻。它的汇报要经过你或写作模型转述后再给用户，并且你要直接核对原始结果文件，不能只信它的汇报。
 - 写作模型（Gemini，当前 {writer}，额度不够时依次换 {writer_alt}）是创意模型。写作强，想 idea 强，世界知识丰富，负责审读论文与文档、出 idea 与优化方向，并把要给用户看或要落盘的文字（给用户的汇报、仓库文档、代码注释、论文）里执行代理留下的难读说法改成人话。执行代理写给你的汇报由你自己读，不必经过写作模型。
-- 你（Claude）定主要优化方向，亲自写方法的核心代码，取舍两边的产出，执笔并修改论文与文档。执行代理通过任务书文件接收指令，通过状态文件汇报。你自己也不写防御性的话，给用户的汇报先说结论和数字，坏结果照实说。
+- 你（{lead}）定主要优化方向，亲自写方法的核心代码，取舍两边的产出，执笔并修改论文与文档。{exec_channel}你自己也不写防御性的话，给用户的汇报先说结论和数字，坏结果照实说。
 
 调用写作模型的规则（中转站按次计费，每条命令只发一个请求）：
 1. 一次把全部内容发过去，例如整篇论文、整份文档或整份汇报，不要按段落分多次发。每次请求尽量多装内容，能合并的任务合并进同一次请求，例如把中英两版、相关的汇报和要问的 idea 放在一起，用 --note 写清各项要求。
@@ -3852,7 +3853,7 @@ COLLAB_CLAUDE_EN = """## Collaboration mode (turned on by ccauth collab; this se
 Division of labour: two models assist you, you make the decisions, and you report to the user and answer to the user.
 - The executor (Codex, now {executor}, alternative {exec_alt}) is the productivity model. It codes and audits well, and handles experiment scripts, parameter search and tuning, running experiments, collecting results and auditing. Its weaknesses are jargon, over-defensive caution and reports that play down bad news. Its reports reach the user only after you or the writer restate them, and you check the raw result files yourself instead of trusting the report.
 - The writer (Gemini, now {writer}, then {writer_alt} when quota runs out) is the creative model. It writes well, generates ideas well and has broad world knowledge. It reviews papers and documents, proposes ideas and optimization directions, and rewrites into plain language whatever the executor left in text meant for the user or kept on disk (reports to the user, repository documents, code comments, papers). You read the executor's reports to you yourself, without the writer.
-- You (Claude) set the main optimization direction, write the core code of the method yourself, choose among what the two produce, and write and revise the papers and documents. The executor takes instructions from the task file and reports in its status file. Do not write defensively yourself either: report conclusions and numbers first, and state bad results plainly.
+- You ({lead}) set the main optimization direction, write the core code of the method yourself, choose among what the two produce, and write and revise the papers and documents. {exec_channel} Do not write defensively yourself either: report conclusions and numbers first, and state bad results plainly.
 
 Rules for calling the writer (the relay bills per request; every command sends exactly one request):
 1. Send everything at once, such as a whole paper, document or report. Do not send it paragraph by paragraph. Pack as much as possible into each request and merge tasks that can share one request, for example both language versions, the related reports and the ideas you want, with each requirement stated in --note.
@@ -3956,6 +3957,11 @@ def collab_writers(st, prov):
     return out
 
 
+def collab_lead(st):
+    lead = st.get("lead") or "claude"
+    return lead if lead in COLLAB_LEADS else "claude"
+
+
 def collab_executor(st):
     return st.get("executor") or COLLAB_DEFAULT_EXECUTOR
 
@@ -3975,10 +3981,22 @@ def collab_write_blocks(on):
     writers = collab_writers(st, agy_provider(pname) if pname in agy_provider_names() else {})
     zh = LANG == "zh"
     sep = "、" if zh else ", "
+    lead = collab_lead(st)
     fill = {"executor": collab_executor(st), "exec_alt": sep.join(collab_executor_alt(st)) or "-",
             "writer": f"{writers[0]} @ {pname}", "writer_alt": sep.join(writers[1:]) or "-"}
-    blocks = [(COLLAB_CLAUDE_ZH if zh else COLLAB_CLAUDE_EN).format(**fill),
-              COLLAB_CODEX_ZH if zh else COLLAB_CODEX_EN]
+    if lead == "codex":
+        fill["lead"] = tt("the Codex main agent", "Codex 主代理")
+        fill["exec_channel"] = tt(f"Hand execution to Codex subagents running {fill['executor']}: state the goal, the constraints and the reporting rules when you spawn one, and check what it returns.",
+                                  f"执行工作派给 Codex 子代理（模型 {fill['executor']}），派发时写清目标、约束和汇报要求，子代理回复后由你核对。")
+    else:
+        fill["lead"] = "Claude"
+        fill["exec_channel"] = tt("The executor takes instructions from the task file and reports in its status file.",
+                                  "执行代理通过任务书文件接收指令，通过状态文件汇报。")
+    lead_block = (COLLAB_CLAUDE_ZH if zh else COLLAB_CLAUDE_EN).format(**fill)
+    exec_block = COLLAB_CODEX_ZH if zh else COLLAB_CODEX_EN
+    # Claude lead: Claude gets the lead section, Codex the executor section.
+    # Codex lead: Claude gets nothing, Codex gets both (the main agent leads, spawned subagents execute).
+    blocks = [lead_block, exec_block] if lead == "claude" else [None, lead_block.rstrip("\n") + "\n\n" + exec_block]
     for path, block in zip(collab_targets(), blocks):
         old = ""
         if os.path.exists(path):
@@ -3987,7 +4005,7 @@ def collab_write_blocks(on):
         elif not on:
             continue
         new = collab_strip(old) if old else ""
-        if on:
+        if on and block:
             new = (new.rstrip("\n") + "\n\n" if new.strip() else "") + COLLAB_BEGIN + "\n" + block.rstrip("\n") + "\n" + COLLAB_END + "\n"
         if new != old:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -4026,6 +4044,7 @@ def collab_status():
         with open(log, encoding="utf-8") as f:
             calls = sum(1 for line in f if today in line[:40])
     print(tt(f"Collaboration mode: {'on' if st.get('enabled') else 'off'}", f"协作模式：{'开' if st.get('enabled') else '关'}"))
+    print(tt(f"Lead model: {collab_lead(st)}", f"主模型：{collab_lead(st)}"))
     print(tt(f"Executor: {collab_executor(st)} (alternative: {', '.join(collab_executor_alt(st)) or '-'})",
              f"执行代理：{collab_executor(st)}（备选 {'、'.join(collab_executor_alt(st)) or '-'}）"))
     print(tt(f"Writer: {' > '.join(collab_writers(st, prov))} through {pname or '?'}",
@@ -4174,6 +4193,7 @@ def collab_main(argv):
   ccauth collab review <file...> [-o out.md] [--venue ICML] [--note "..."] [--model M] [--provider P]
   ccauth collab explain <file...> [-o out.md] [--note "..."]
   ccauth collab ideas <file...> [-o out.md] [--note "..."] [--search]
+  ccauth collab lead claude|codex                        the lead model that decides and writes (default claude)
   ccauth collab executor <model>[,<alternative>...]     e.g. gpt-6.1-sol,gpt-6-astra
   ccauth collab writers <model>[,<fallback>...]         e.g. gemini-4-neon-xhigh,gemini-4-argon-high
   ccauth collab reserve <dollars>                        at least one key keeps this balance (default 30)
@@ -4186,6 +4206,7 @@ review, explain and ideas send all files in one request and return Markdown.""",
   ccauth collab review <文件...> [-o 意见.md] [--venue ICML] [--note "额外要求"] [--model 模型] [--provider 中转站]
   ccauth collab explain <文件...> [-o 摘要.md] [--note "额外要求"]
   ccauth collab ideas <文件...> [-o 思路.md] [--note "额外要求"] [--search]
+  ccauth collab lead claude|codex                主模型（做决策、执笔），默认 claude
   ccauth collab executor <模型>[,<备选>...]       例如 gpt-6.1-sol,gpt-6-astra
   ccauth collab writers <模型>[,<备用>...]        例如 gemini-4-neon-xhigh,gemini-4-argon-high（前一个额度不够时换下一个）
   ccauth collab reserve <美元>                    至少一个 key 保留这么多余额（默认 30），到线就拒绝发送
@@ -4226,6 +4247,19 @@ review、explain、ideas 都把全部文件放进一次请求发出，返回 Mar
         if st.get("enabled"):
             collab_write_blocks(True)
         print(tt(f"Writer {cmd}: {rest[0]}", f"写作{'模型' if cmd == 'model' else '中转站'}已设为 {rest[0]}"))
+    elif cmd == "lead" and len(rest) == 1:
+        if rest[0] not in COLLAB_LEADS:
+            agy_die("The lead model is claude or codex.", "主模型只能是 claude 或 codex")
+        st = collab_state()
+        st["lead"] = rest[0]
+        collab_state_save(st)
+        if st.get("enabled"):
+            collab_write_blocks(True)
+        print(tt(f"Lead model: {rest[0]}", f"主模型已设为 {rest[0]}") + (
+            tt(" (Claude gets the lead section, Codex the executor section)", "（Claude 写入主导说明，Codex 写入执行说明）")
+            if rest[0] == "claude" else
+            tt(" (Codex gets both sections: the main agent leads, subagents execute; Claude gets none)",
+               "（Codex 写入主导与执行两节：主代理决策，子代理执行；Claude 不写入）")))
     elif cmd == "reserve" and len(rest) == 1:
         st = collab_state()
         st["reserve_usd"] = float(rest[0])
@@ -4327,7 +4361,8 @@ def gui_collab():
             "writers": collab_writers(st, prov), "writer_options": sorted(set((prov.get("models") or []) + collab_writers(st, prov))),
             "executor": collab_executor(st), "executor_alt": collab_executor_alt(st),
             "executor_options": sorted(set(catalog + [collab_executor(st)] + collab_executor_alt(st))),
-            "calls_today": _collab_calls_today(), "reserve_usd": float(st.get("reserve_usd", 30))}
+            "calls_today": _collab_calls_today(), "reserve_usd": float(st.get("reserve_usd", 30)),
+            "lead": collab_lead(st)}
 
 
 def _collab_calls_today():

@@ -27,6 +27,7 @@ struct CollabState: Decodable {
     var executor_options: [String]?
     var calls_today: Int?
     var reserve_usd: Double?
+    var lead: String?
 }
 
 struct Accounts: Decodable {
@@ -482,8 +483,13 @@ struct CollabView: View {
                 Section {
                     Toggle("开启协作模式", isOn: Binding(get: { c.enabled },
                                                    set: { store.run(["collab", $0 ? "on" : "off"]) }))
+                    Picker("主模型（决策与执笔）", selection: Binding(get: { c.lead ?? "claude" },
+                                                          set: { store.run(["collab", "lead", $0]) })) {
+                        Text("Claude").tag("claude")
+                        Text("Codex").tag("codex")
+                    }
                 } header: { Text("分工") } footer: {
-                    Text("Claude 做决策、写方法核心代码、执笔论文，并对你汇报和负责。执行代理是生产力模型，写实验脚本、调参、跑实验与审计。写作模型是创意模型，审读稿件、出 idea，把要给你看或要落盘的文字改成人话。开启后写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，关闭时删除，对新开的会话生效。").font(.caption).foregroundStyle(.secondary)
+                    Text("主模型做决策、写方法核心代码、执笔论文，并对你汇报和负责。选 Codex 时由 Codex 主代理担任，执行工作派给它的子代理。执行代理是生产力模型，写实验脚本、调参、跑实验与审计。写作模型是创意模型，审读稿件、出 idea，把要给你看或要落盘的文字改成人话。开启后按主模型写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，关闭时删除，对新开的会话生效。").font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
                     Picker("执行代理", selection: Binding(get: { c.executor ?? "gpt-6.1-sol" },
