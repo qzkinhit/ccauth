@@ -4027,15 +4027,53 @@ def collab_status():
     print(tt(f"Writer: {' > '.join(collab_writers(st, prov))} through {pname or '?'}",
              f"写作模型：{' > '.join(collab_writers(st, prov))}（中转站 {pname or '?'}，前一个额度不够时换下一个）"))
     print(tt(f"Writer requests today: {calls}", f"今天已调用写作模型 {calls} 次"))
+    reserve = float(st.get("reserve_usd", 30))
+    for p in (agy_chain(prov) if prov else []):
+        left, _used, err = agy_quota_of(p)
+        print(tt(f"  {p.get('name')}: " + (f"${left:.2f} left" if left is not None else f"unknown ({err})"),
+                 f"  {p.get('name')}：" + (f"剩余 ${left:.2f}" if left is not None else f"查询失败（{err}）")))
+    print(tt(f"Reserve: at least one key keeps ${reserve:.0f}", f"保留线：至少一个 key 保留 ${reserve:.0f}"))
 
 
-def collab_call(task, files, out, note, model=None, provider=None, search=False):
+def collab_pick_account(prov, st, force=False):
+    """Pick the key of the provider chain (the provider and its fallbacks) for this request.
+
+    At least one key of the chain must keep the reserve (collab reserve, default 30 dollars). The key with the
+    smallest balance that still leaves another key at or above the reserve is spent first. When no key can be
+    spent without breaking the reserve the request is refused, unless --force is given."""
+    reserve = float(st.get("reserve_usd", 30))
+    margin = 1.0
+    chain = agy_chain(prov)
+    lefts = []
+    for p in chain:
+        left, _used, err = agy_quota_of(p)
+        lefts.append(left)
+    known = [(l, p) for l, p in zip(lefts, chain) if l is not None]
+    if not known:
+        print(tt("Writer quota unknown; sending anyway.", "查不到写作中转站余额，照常发送。"), file=sys.stderr)
+        return prov, lefts
+    best = max(l for l, _ in known)
+    for left, p in sorted(known, key=lambda item: item[0]):
+        others = max([l for l, q in known if q is not p] or [0.0])
+        if left > margin and (others >= reserve or left - margin >= reserve):
+            return p, lefts
+    if force:
+        return max(known, key=lambda item: item[0])[1], lefts
+    agy_die(f"Writer quota reserve reached: the best key has ${best:.2f}, the reserve is ${reserve:.0f}. "
+            "Use --force to send anyway, or lower it with: ccauth collab reserve <dollars>",
+            f"写作中转站余额已到保留线：余额最多的 key 只剩 ${best:.2f}，保留线 ${reserve:.0f}。"
+            "确需发送加 --force，或用 ccauth collab reserve <美元> 调整保留线")
+
+
+def collab_call(task, files, out, note, model=None, provider=None, search=False, force=False):
     st = collab_state()
     pname = provider or collab_provider_name(st)
     if not pname or pname not in agy_provider_names():
         agy_die("No agy provider is configured for the writer. Add one with: ccauth agy add <name> <url> <key>",
                 "没有可用的 agy 中转站，先用 ccauth agy add <名字> <地址> <key> 添加")
     prov = agy_provider(pname)
+    prov, lefts = collab_pick_account(prov, st, force)
+    pname = prov.get("name", pname)
     chain = [model] if model else collab_writers(st, prov)
     parts = []
     for path in files:
@@ -4063,7 +4101,8 @@ def collab_call(task, files, out, note, model=None, provider=None, search=False)
                                      headers={"Content-Type": "application/json", "x-goog-api-key": prov["key"]})
         started = time.time()
         record = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "task": task, "model": model,
-                  "provider": pname, "chars_in": len(text), "search": bool(search)}
+                  "provider": pname, "chars_in": len(text), "search": bool(search),
+                  "balances_before": [None if l is None else round(l, 2) for l in lefts]}
         try:
             pieces, broken, last = [], None, ""
             with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=1800) as r:
@@ -4131,6 +4170,7 @@ def collab_main(argv):
   ccauth collab ideas <file...> [-o out.md] [--note "..."] [--search]
   ccauth collab executor <model>[,<alternative>...]     e.g. gpt-6.1-sol,gpt-6-astra
   ccauth collab writers <model>[,<fallback>...]         e.g. gemini-4-neon-xhigh,gemini-4-argon-high
+  ccauth collab reserve <dollars>                        at least one key keeps this balance (default 30)
   ccauth collab model <name> | provider <name>
 
 review, explain and ideas send all files in one request and return Markdown.""",
@@ -4142,6 +4182,7 @@ review, explain and ideas send all files in one request and return Markdown.""",
   ccauth collab ideas <文件...> [-o 思路.md] [--note "额外要求"] [--search]
   ccauth collab executor <模型>[,<备选>...]       例如 gpt-6.1-sol,gpt-6-astra
   ccauth collab writers <模型>[,<备用>...]        例如 gemini-4-neon-xhigh,gemini-4-argon-high（前一个额度不够时换下一个）
+  ccauth collab reserve <美元>                    至少一个 key 保留这么多余额（默认 30），到线就拒绝发送
   ccauth collab model <模型> | provider <中转站>
 
 review、explain、ideas 都把全部文件放进一次请求发出，返回 Markdown。--search 让写作模型联网检索。""")
@@ -4179,15 +4220,21 @@ review、explain、ideas 都把全部文件放进一次请求发出，返回 Mar
         if st.get("enabled"):
             collab_write_blocks(True)
         print(tt(f"Writer {cmd}: {rest[0]}", f"写作{'模型' if cmd == 'model' else '中转站'}已设为 {rest[0]}"))
+    elif cmd == "reserve" and len(rest) == 1:
+        st = collab_state()
+        st["reserve_usd"] = float(rest[0])
+        collab_state_save(st)
+        print(tt(f"Writer quota reserve: ${st['reserve_usd']:.0f}", f"写作中转站保留线已设为 ${st['reserve_usd']:.0f}"))
     elif cmd in ("review", "explain", "ideas"):
         search = "--search" in rest
-        rest = [a for a in rest if a != "--search"]
+        force = "--force" in rest
+        rest = [a for a in rest if a not in ("--search", "--force")]
         out = _opt(rest, "-o")
         note = _opt(rest, "--note")
         model = _opt(rest, "--model")
         provider = _opt(rest, "--provider")
         files = list(rest)
-        collab_call(cmd, files, out, note, model, provider, search)
+        collab_call(cmd, files, out, note, model, provider, search, force)
     else:
         print(usage)
         sys.exit(1)
