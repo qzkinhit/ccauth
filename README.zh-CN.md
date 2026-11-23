@@ -255,6 +255,21 @@ ccauth codex off                      # 恢复 CC Switch 写入的配置
 
 有些中转站会拒绝自称 Codex 的系统提示，返回 429。发往 Gemini 中转站的请求中，developer、system 消息和 instructions 里的 Codex、OpenAI 字样会被替换为中性说法。主代理模型冷却或下架时依次改用 `gemini-4-hydrogen-xhigh`、`gemini-3.8-flash-high`，中转站 key 额度用完时沿用 `ccauth agy fallback` 的设置换 key。设置对新开的 Codex 会话生效。
 
+## 协作模式：Claude 决策，Codex 执行，Gemini 审读写作
+
+三个代理分工处理同一个项目。Claude 做决策、定优化方向、执笔论文与文档。Codex 的执行代理（例如 gpt-6.1-sol）跑实验、写代码、审计，并在任务书给定的目标内优化。Gemini 写作模型（默认 gemini-4-neon-xhigh）审读稿件，并把执行代理的汇报翻译成人话。
+
+```
+ccauth collab on                      # 写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md 中带标记的一节
+ccauth collab off                     # 删除这两节，其余内容不动
+ccauth collab status                  # 开关、写作模型、今天的调用次数
+ccauth collab review a.tex b.tex -o review.md     # 全部文件一次发出，返回 Markdown 审读意见
+ccauth collab explain STATUS.md -o summary.md     # 把执行代理的汇报翻译成人话
+ccauth collab model gemini-4-neon-xhigh           # 换写作模型；provider <名字> 换中转站
+```
+
+写作模型走 agy 中转站的原生 Gemini 接口，每条 review 或 explain 命令只发一个请求，适合按次计费的中转站。每次调用记在 `~/.ccauth/collab_calls.jsonl`。macOS 软件的 Codex 页有对应开关。
+
 ## macOS 软件
 
 `mac/` 目录是一个原生 SwiftUI 软件，覆盖 ccauth 的全部功能：Antigravity 官方与第三方切换、中转站设置与余额、Codex 分流、每日签到、Claude 与 Gemini CLI 多账号。软件里的每个操作都调用 `ccauth` 命令，窗口内容来自 `ccauth state` 输出的 JSON，所以命令行与软件的功能一致。

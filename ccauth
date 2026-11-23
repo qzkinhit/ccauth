@@ -22,10 +22,10 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 RESERVED = {"save", "use", "list", "ls", "status", "current", "rm", "remove",
-            "help", "version", "path", "gemini", "agy", "official", "codex", "state"}
+            "help", "version", "path", "gemini", "agy", "official", "codex", "state", "collab"}
 
 # Account-scoped caches in the global config. They describe the previous
 # account's subscription and model entitlements, so they must be dropped on
@@ -96,6 +96,9 @@ Usage (Antigravity: agy CLI and desktop app):
 
 Usage (Codex: Gemini main agent, CC Switch subagents):
   ccauth codex <subcommand>      run 'ccauth codex help'
+
+Usage (collaboration mode: Claude decides, Codex sol executes, Gemini neon reviews writing):
+  ccauth collab <subcommand>     run 'ccauth collab help'
 
 Machine-readable state (used by the macOS app):
   ccauth state                   print all accounts, relays, check-in and Codex routing as JSON
@@ -182,6 +185,9 @@ Profile directory:  {profiles}""",
 
 用法（Codex：主代理用 Gemini，子代理用 CC Switch 选中的服务商）
   ccauth codex <子命令>          运行 ccauth codex help 查看
+
+协作模式（Claude 决策，Codex 的 sol 执行，Gemini 的 neon 审读写作）：
+  ccauth collab <子命令>         运行 ccauth collab help 查看
 
 机器可读状态（供 macOS 应用读取）
   ccauth state                   以 JSON 输出全部账号、中转站、签到与 Codex 分流状态
@@ -3810,6 +3816,292 @@ def codex_main(argv):
 # GUI: a local web panel served on 127.0.0.1 (the macOS app wraps it in a window)
 # --------------------------------------------------------------------------
 
+# ---------------------------------------------------------------- collaboration mode
+#
+# Three agents share one project. Claude makes the decisions and sets the optimization direction,
+# a Codex executor (sol) runs experiments, audits and optimizes, and a Gemini writer (neon) reviews
+# writing and turns the executor's reports into plain language. Turning the mode on writes a marked
+# block into ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; turning it off removes both blocks.
+# The writer is called through the plain Gemini API of an agy provider, one request per call,
+# because relay sites bill per request.
+
+COLLAB_BEGIN = "<!-- ccauth collab: begin -->"
+COLLAB_END = "<!-- ccauth collab: end -->"
+COLLAB_DEFAULT_MODEL = "gemini-4-neon-xhigh"
+
+COLLAB_CLAUDE_ZH = """## 协作模式（由 ccauth collab 开启，关闭时本节自动删除）
+
+三方分工：
+- Claude（你）做决策，定主要优化方向，审核结果，执笔并修改论文与文档。
+- Codex 的执行代理 sol（gpt-6.1-sol）执行实验、写代码、审计，并在任务书给定的目标内优化。它从任务书文件接收指令，用状态文件汇报。
+- 写作模型 neon（{model}，经 {provider} 中转）审读论文与文档并给出润色意见，也把 sol 的汇报翻译成用户读得懂的中文。
+
+调用 neon 的规则（中转站按次计费，每次命令只发一个请求）：
+1. 一次把要审的全部内容发过去，例如整篇论文、整份文档或整份汇报，不要按段落分多次发。
+2. 只让 neon 返回审读意见 md，由你逐条核对后自己改稿落盘，不让 neon 重写全文或替你写文件。
+3. 不频繁调用。一篇稿子在定稿前或大改后调一次，sol 的汇报只在要转述给用户时调一次。
+4. 写作审读用 `ccauth collab review <文件...> -o <意见.md>`，翻译 sol 汇报用 `ccauth collab explain <文件...> -o <摘要.md>`，可加 `--note "额外要求"`。
+5. 不采纳改动数字、引用、公式、宏、术语或论断强度的建议。
+"""
+
+COLLAB_CLAUDE_EN = """## Collaboration mode (turned on by ccauth collab; this section is removed when it is turned off)
+
+Roles:
+- Claude (you) makes the decisions, sets the main optimization direction, reviews results, and writes and revises papers and documents.
+- The Codex executor sol (gpt-6.1-sol) runs experiments, writes code, audits, and optimizes within the goals of the task file. It takes instructions from the task file and reports in its status file.
+- The writing model neon ({model}, through the {provider} relay) reviews papers and documents with editing suggestions, and translates sol's reports into plain language for the user.
+
+Rules for calling neon (the relay bills per request; every command sends exactly one request):
+1. Send everything to be reviewed at once, such as a whole paper, document or report. Do not send it paragraph by paragraph.
+2. Ask neon only for a review in Markdown. Check each point yourself and make the edits yourself. Do not let neon rewrite the whole text or write files.
+3. Call it rarely: once per manuscript before it is finalized or after a major revision, and once per sol report that you need to relay to the user.
+4. Use `ccauth collab review <files...> -o <review.md>` for writing review and `ccauth collab explain <files...> -o <summary.md>` for sol reports, optionally with `--note "extra instruction"`.
+5. Reject any suggestion that changes numbers, citations, formulas, macros, terms or the strength of a claim.
+"""
+
+COLLAB_CODEX_ZH = """## 协作模式（由 ccauth collab 开启，关闭时本节自动删除）
+
+你作为执行代理 sol 处理 Claude 写的任务书时，负责执行、审计与优化：按任务书跑实验、写代码、核验结果，并在任务书给定的目标内自行优化。决策与优化方向以任务书为准，论文与文档由 Claude 执笔，你不改。
+
+汇报要让作者一读就懂。状态文件只写四块：结果表（每个数注明来源文件）、在跑的作业、下一步、需要决定的问题。哈希、进程号、步数账目等留档细节放附属文件，正文不写“不能据此声明”“不证明”“仅作探索”之类的限定句，同一条规则不在每份报告里复述。开发期核验到结果能复算为止，独立重放只在最终运行上做一次。
+"""
+
+COLLAB_CODEX_EN = """## Collaboration mode (turned on by ccauth collab; this section is removed when it is turned off)
+
+When you act as the executor sol on a task file written by Claude, you execute, audit and optimize: run the experiments, write the code, verify the results, and optimize within the goals of the task file. Decisions and optimization direction come from the task file. Claude writes the papers and documents, and you do not edit them.
+
+Reports must be readable at first sight. The status file has four parts only: a results table with the source file of every number, the running jobs, the next steps, and the questions that need a decision. Hashes, process ids, step ledgers and other records go into side files. Do not write qualifiers such as "this cannot be claimed" or "exploratory only", and do not restate the same rule in every report. During development, verification stops once a result can be recomputed. Independent replays are done once, on the final runs.
+"""
+
+COLLAB_REVIEW_ZH = """你是学术写作审读者。用户给出一份完整的稿件或文档。通读全文后给出审读意见，用 Markdown 输出，不要重写全文。
+格式：按出现顺序列条目，每条写明位置（章节名或段落开头几个词）、原句、问题、建议改法（给出改后的整句）。最后给三到五条全局意见，涉及结构、逻辑衔接与术语一致性。若同时给出中英两版，检查两版是否对应。
+重点检查：逻辑是否环环相扣；句子是否清楚，主谓宾是否明确；术语前后是否一致；是否有 AI 腔与矫饰，包括破折号、分号、说明性冒号、修辞性短句、对仗排比、卖关子、“不是A而是B”、结尾拔高、拟人化、空洞过渡词；除法是否写成斜杠。
+不要建议改动数字、引用、公式、LaTeX 宏与论断强度，不要建议补充新内容、防御性说明或工程细节。"""
+
+COLLAB_REVIEW_EN = """You review academic writing. The user gives a complete manuscript or document. Read all of it, then give a review in Markdown. Do not rewrite the whole text.
+Format: list the points in reading order. Each point gives the location (section name or the first words of the paragraph), the original sentence, the problem, and a suggested fix as a full rewritten sentence. End with three to five global points on structure, logical flow and consistent terms. If two language versions are given, check that they match.
+Check: whether each step of the argument follows from the previous one; whether sentences are clear with an explicit subject, verb and object; consistent terms; AI-sounding or mannered prose, including dashes, semicolons, explanatory colons, rhetorical fragments, forced parallels, suspense set-ups, "not A but B" contrasts, grand closing lines, personification and empty transitions; divisions written with a slash.
+Do not suggest changes to numbers, citations, formulas, LaTeX macros or the strength of claims, and do not suggest adding new content, defensive caveats or engineering details."""
+
+COLLAB_EXPLAIN_ZH = """下面是执行代理写的工作汇报，里面有大量工程术语和限定句。把它翻译成作者一读就懂的简体中文摘要，用 Markdown 输出，只写四部分：已完成的结果（关键数字照抄并说明含义）、正在进行的工作、遇到的问题、需要作者或 Claude 决定的事。去掉哈希值、进程号、路径细节和重复的限定句，不添加原文没有的信息，不评价好坏。"""
+
+COLLAB_EXPLAIN_EN = """Below is a work report written by an executor agent, full of engineering terms and qualifiers. Turn it into a summary the author can read at first sight, in Markdown, with four parts only: finished results (copy the key numbers and say what they mean), work in progress, problems met, and decisions needed from the author or Claude. Drop hashes, process ids, path details and repeated qualifiers. Do not add anything the report does not say, and do not judge."""
+
+
+def collab_state_file():
+    return os.path.join(store_dir_root(), "collab.json")
+
+
+def store_dir_root():
+    return os.path.expanduser("~/.ccauth")
+
+
+def collab_state():
+    return _read_json(collab_state_file(), {}) or {}
+
+
+def collab_state_save(st):
+    os.makedirs(store_dir_root(), exist_ok=True)
+    _write_private(collab_state_file(), json.dumps(st, indent=2, ensure_ascii=False))
+
+
+def collab_targets():
+    return [os.path.expanduser("~/.claude/CLAUDE.md"), os.path.expanduser("~/.codex/AGENTS.md")]
+
+
+def collab_provider_name(st):
+    if st.get("provider"):
+        return st["provider"]
+    relay = codex_state().get("relay")
+    if relay and relay in agy_provider_names():
+        return relay
+    active = agy_state().get("active")
+    if active and active in agy_provider_names():
+        return active
+    names = agy_provider_names()
+    return names[0] if names else None
+
+
+def collab_model(st, prov):
+    if st.get("model"):
+        return st["model"]
+    models = (prov or {}).get("models") or []
+    if not models or COLLAB_DEFAULT_MODEL in models:
+        return COLLAB_DEFAULT_MODEL
+    return (prov or {}).get("writer") or (prov or {}).get("default") or models[-1]
+
+
+def collab_strip(text):
+    return re.sub(r"\n*" + re.escape(COLLAB_BEGIN) + r".*?" + re.escape(COLLAB_END) + r"\n?", "\n",
+                  text, flags=re.S).rstrip("\n") + "\n"
+
+
+def collab_write_blocks(on):
+    st = collab_state()
+    pname = collab_provider_name(st) or "?"
+    model = collab_model(st, agy_provider(pname) if pname in agy_provider_names() else {})
+    zh = LANG == "zh"
+    blocks = [(COLLAB_CLAUDE_ZH if zh else COLLAB_CLAUDE_EN).format(model=model, provider=pname),
+              COLLAB_CODEX_ZH if zh else COLLAB_CODEX_EN]
+    for path, block in zip(collab_targets(), blocks):
+        old = ""
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                old = f.read()
+        elif not on:
+            continue
+        new = collab_strip(old) if old else ""
+        if on:
+            new = (new.rstrip("\n") + "\n\n" if new.strip() else "") + COLLAB_BEGIN + "\n" + block.rstrip("\n") + "\n" + COLLAB_END + "\n"
+        if new != old:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new)
+
+
+def collab_on():
+    st = collab_state()
+    st["enabled"] = True
+    collab_state_save(st)
+    collab_write_blocks(True)
+    print(tt("Collaboration mode on: Claude decides, sol executes and audits, neon reviews writing. "
+             "Written to ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; new sessions pick it up.",
+             "协作模式已开启：Claude 决策，sol 执行与审计，neon 审读写作并翻译汇报。"
+             "已写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，对新开的会话生效。"))
+
+
+def collab_off():
+    st = collab_state()
+    st["enabled"] = False
+    collab_state_save(st)
+    collab_write_blocks(False)
+    print(tt("Collaboration mode off: the blocks were removed from ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md.",
+             "协作模式已关闭，已从 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md 删除对应段落。"))
+
+
+def collab_status():
+    st = collab_state()
+    pname = collab_provider_name(st)
+    prov = agy_provider(pname) if pname in agy_provider_names() else {}
+    calls = 0
+    log = os.path.join(store_dir_root(), "collab_calls.jsonl")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if os.path.exists(log):
+        with open(log, encoding="utf-8") as f:
+            calls = sum(1 for line in f if today in line[:40])
+    print(tt(f"Collaboration mode: {'on' if st.get('enabled') else 'off'}", f"协作模式：{'开' if st.get('enabled') else '关'}"))
+    print(tt(f"Writer: {collab_model(st, prov)} through {pname or '?'}", f"写作模型：{collab_model(st, prov)}（中转站 {pname or '?'}）"))
+    print(tt(f"Writer requests today: {calls}", f"今天已调用写作模型 {calls} 次"))
+
+
+def collab_call(task, files, out, note, model=None, provider=None):
+    st = collab_state()
+    pname = provider or collab_provider_name(st)
+    if not pname or pname not in agy_provider_names():
+        agy_die("No agy provider is configured for the writer. Add one with: ccauth agy add <name> <url> <key>",
+                "没有可用的 agy 中转站，先用 ccauth agy add <名字> <地址> <key> 添加")
+    prov = agy_provider(pname)
+    model = model or collab_model(st, prov)
+    parts = []
+    for path in files:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            parts.append(f"===== {os.path.basename(path)} =====\n{f.read()}")
+    if not parts:
+        agy_die("Give at least one file.", "至少给一个文件")
+    zh = LANG == "zh"
+    system = {"review": COLLAB_REVIEW_ZH if zh else COLLAB_REVIEW_EN,
+              "explain": COLLAB_EXPLAIN_ZH if zh else COLLAB_EXPLAIN_EN}[task]
+    text = "\n\n".join(parts)
+    if note:
+        text = (tt("Extra instruction: ", "额外要求：") + note + "\n\n" + text)
+    payload = {"systemInstruction": {"parts": [{"text": system}]},
+               "contents": [{"role": "user", "parts": [{"text": text}]}],
+               "generationConfig": {"temperature": 0.3}}
+    url = prov["url"].rstrip("/") + f"/v1beta/models/{model}:generateContent"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "x-goog-api-key": prov["key"]})
+    started = time.time()
+    record = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "task": task, "model": model,
+              "provider": pname, "chars_in": len(text)}
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=1800) as r:
+            data = json.loads(r.read())
+        cands = data.get("candidates") or []
+        answer = "".join(p.get("text", "") for p in ((cands[0].get("content") or {}).get("parts") or [])
+                         if isinstance(p, dict) and not p.get("thought")) if cands else ""
+        if not answer:
+            raise ValueError("empty answer: " + json.dumps(data)[:300])
+        record.update(ok=True, chars_out=len(answer), seconds=round(time.time() - started, 1))
+    except urllib.error.HTTPError as e:
+        record.update(ok=False, error=f"HTTP {e.code}")
+        _collab_log(record)
+        agy_die(f"The writer request failed: HTTP {e.code} {e.read()[:300]!r}", f"写作模型请求失败：HTTP {e.code} {e.read()[:300]!r}")
+    except Exception as e:
+        record.update(ok=False, error=repr(e)[:200])
+        _collab_log(record)
+        agy_die(f"The writer request failed: {e!r}", f"写作模型请求失败：{e!r}")
+    _collab_log(record)
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(answer.rstrip("\n") + "\n")
+        print(tt(f"1 request to {model}; {len(text)} characters in, {len(answer)} out; written to {out}",
+                 f"已向 {model} 发 1 次请求，输入 {len(text)} 字符，输出 {len(answer)} 字符，写入 {out}"))
+    else:
+        print(answer)
+
+
+def _collab_log(record):
+    os.makedirs(store_dir_root(), exist_ok=True)
+    with open(os.path.join(store_dir_root(), "collab_calls.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def collab_main(argv):
+    usage = tt("""ccauth collab - Claude decides, a Codex executor (sol) executes and audits, a Gemini writer (neon) reviews writing
+
+  ccauth collab on | off | status
+  ccauth collab review <file...> [-o out.md] [--note "..."] [--model M] [--provider P]
+  ccauth collab explain <file...> [-o out.md] [--note "..."]
+  ccauth collab model <name> | provider <name>
+
+review and explain send all files in one request and return a Markdown review or summary.""",
+               """ccauth collab - 协作模式：Claude 决策，Codex 执行代理 sol 执行与审计，Gemini 写作模型 neon 审读写作
+
+  ccauth collab on | off | status
+  ccauth collab review <文件...> [-o 意见.md] [--note "额外要求"] [--model 模型] [--provider 中转站]
+  ccauth collab explain <文件...> [-o 摘要.md] [--note "额外要求"]
+  ccauth collab model <模型> | provider <中转站>
+
+review 与 explain 把全部文件放进一次请求发出，返回 Markdown 审读意见或摘要。""")
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(usage)
+        return
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "on":
+        collab_on()
+    elif cmd == "off":
+        collab_off()
+    elif cmd == "status":
+        collab_status()
+    elif cmd in ("model", "provider") and len(rest) == 1:
+        st = collab_state()
+        st[cmd] = rest[0]
+        collab_state_save(st)
+        if st.get("enabled"):
+            collab_write_blocks(True)
+        print(tt(f"Writer {cmd}: {rest[0]}", f"写作{'模型' if cmd == 'model' else '中转站'}已设为 {rest[0]}"))
+    elif cmd in ("review", "explain"):
+        out = _opt(rest, "-o")
+        note = _opt(rest, "--note")
+        model = _opt(rest, "--model")
+        provider = _opt(rest, "--provider")
+        files = list(rest)
+        collab_call(cmd, files, out, note, model, provider)
+    else:
+        print(usage)
+        sys.exit(1)
+
+
 def system_https_proxy():
     """HTTPS proxy from the environment, else from macOS network settings."""
     px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
@@ -3877,7 +4169,15 @@ def gui_state():
                   "relay": cs.get("relay"), "upstream": cs.get("upstream"),
                   "ccswitch_model": cs.get("ccswitch_model"), "fallback_models": cs.get("fallback_models"),
                   "router": codex_router_alive()},
+        "collab": gui_collab(),
     }
+
+
+def gui_collab():
+    st = collab_state()
+    pname = collab_provider_name(st)
+    prov = (_read_json(os.path.join(agy_provider_dir(), pname + ".json"), {}) or {}) if pname else {}
+    return {"enabled": bool(st.get("enabled")), "provider": pname, "model": collab_model(st, prov)}
 
 
 def gui_officials():
@@ -3937,6 +4237,9 @@ def main():
         return
     if cmd == "state":
         gui_print_state()
+        return
+    if cmd == "collab":
+        collab_main(rest)
         return
     force = "--force" in rest or "-f" in rest
     rest = [a for a in rest if a not in ("--force", "-f")]

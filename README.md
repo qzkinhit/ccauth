@@ -255,6 +255,21 @@ When on, the provider's `base_url` points at the router, `model` becomes the mai
 
 Some relays answer a system prompt that introduces itself as Codex with 429. In requests sent to the Gemini relay, Codex and OpenAI in developer and system messages and in instructions are replaced with neutral wording. A cooling or withdrawn main model falls back to `gemini-4-hydrogen-xhigh`, then `gemini-3.8-flash-high`, and a used-up relay key follows the `ccauth agy fallback` setting. Changes apply to new Codex sessions.
 
+## Collaboration mode: Claude decides, Codex executes, Gemini reviews writing
+
+Three agents share one project. Claude makes the decisions, sets the optimization direction and writes the papers and documents. A Codex executor (for example gpt-6.1-sol) runs experiments, writes code, audits and optimizes within the goals of a task file. A Gemini writing model (gemini-4-neon-xhigh by default) reviews manuscripts and turns the executor's reports into plain language.
+
+```
+ccauth collab on                      # write a marked section into ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md
+ccauth collab off                     # remove both sections, leave the rest untouched
+ccauth collab status                  # switch, writing model, requests today
+ccauth collab review a.tex b.tex -o review.md     # all files in one request, Markdown review back
+ccauth collab explain STATUS.md -o summary.md     # plain-language summary of an executor report
+ccauth collab model gemini-4-neon-xhigh           # change the writing model; provider <name> changes the relay
+```
+
+The writing model is called through the plain Gemini API of an agy relay. Every review or explain command sends exactly one request, which suits relays that bill per call. Each call is logged in `~/.ccauth/collab_calls.jsonl`. The macOS app has the switch on its Codex page.
+
 ## macOS app
 
 `mac/` holds a native SwiftUI app covering every ccauth feature: Antigravity official and relay modes, relay settings and balances, Codex routing, daily check-in, and Claude and Gemini CLI accounts. Each action runs the `ccauth` command and the window is drawn from the JSON that `ccauth state` prints, so the app and the command line stay in step.

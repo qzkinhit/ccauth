@@ -13,6 +13,13 @@ struct AppState: Decodable {
     var agy: Agy
     var checkin: Checkin
     var codex: CodexState
+    var collab: CollabState?
+}
+
+struct CollabState: Decodable {
+    var enabled: Bool
+    var provider: String?
+    var model: String?
 }
 
 struct Accounts: Decodable {
@@ -449,6 +456,16 @@ struct CodexView: View {
                 LabeledContent("CC Switch 当前服务商") { Text(s.codex.upstream ?? "?").foregroundStyle(.secondary).textSelection(.enabled) }
             } header: { Text("子代理（CC Switch 选中的公益站）") } footer: {
                 Text("派出的子代理统一使用这里的思考强度，主代理派子代理时指定的强度也会被覆盖。在 Codex 里直接选的模型和后台小模型不受影响。服务商不接受时自动降一档并记住 30 分钟。").font(.caption).foregroundStyle(.secondary)
+            }
+
+            if let c = s.collab {
+                Section {
+                    Toggle("开启协作模式", isOn: Binding(get: { c.enabled },
+                                                   set: { store.run(["collab", $0 ? "on" : "off"]) }))
+                    LabeledContent("写作模型") { Text("\(c.model ?? "?")（\(c.provider ?? "?")）") }
+                } header: { Text("协作模式") } footer: {
+                    Text("Claude 做决策和主要优化方向，Codex 的 sol 执行、审计与优化，写作模型审读稿件并把 sol 的汇报翻译成人话。开启后写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，关闭时删除，对新开的会话生效。写作模型按次计费，每次审读只发一个请求。").font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
