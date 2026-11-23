@@ -3843,7 +3843,7 @@ COLLAB_CLAUDE_ZH = """## 协作模式（由 ccauth collab 开启，关闭时本�
 1. 一次把全部内容发过去，例如整篇论文、整份文档或整份汇报，不要按段落分多次发。每次请求尽量多装内容，能合并的任务合并进同一次请求，例如把中英两版、相关的汇报和要问的 idea 放在一起，用 --note 写清各项要求。
 2. 只让它返回 Markdown 意见，由你逐条核对后自己改稿落盘，不让它重写全文或替你写文件。
 3. 不频繁调用。一篇稿子在定稿前或大改后调一次；给用户的汇报或要落盘的文档、代码注释只在发出或提交前调一次，并尽量和其他内容合并；出 idea 只在遇到瓶颈或定新方向时调一次。你自己读执行代理的汇报，不为此调用写作模型。
-4. 写作审读 `ccauth collab review <文件...> -o 意见.md`，翻译汇报 `ccauth collab explain <文件...> -o 摘要.md`，出 idea `ccauth collab ideas <背景与结果文件...> -o 思路.md [--search]`，都可加 `--note "额外要求"`。
+4. 写作审读 `ccauth collab review <文件...> -o 意见.md [--venue ICML]`（--venue 让它同时按该会议的审稿表给完整评审），翻译汇报 `ccauth collab explain <文件...> -o 摘要.md`，出 idea `ccauth collab ideas <背景与结果文件...> -o 思路.md [--search]`，都可加 `--note "额外要求"`。
 5. 不采纳改动数字、引用、公式、宏、术语或论断强度的建议。它给的 idea 是选项，采纳与否由你决定。
 """
 
@@ -3858,7 +3858,7 @@ Rules for calling the writer (the relay bills per request; every command sends e
 1. Send everything at once, such as a whole paper, document or report. Do not send it paragraph by paragraph. Pack as much as possible into each request and merge tasks that can share one request, for example both language versions, the related reports and the ideas you want, with each requirement stated in --note.
 2. Ask only for Markdown feedback. Check each point and make the edits yourself. Do not let it rewrite the whole text or write files.
 3. Call it rarely: once per manuscript before it is finalized or after a major revision; once before sending or committing a user-facing report, document or code comments, merged with other content where possible; and once per bottleneck or new direction for ideas. Do not call it to read the executor's reports to you.
-4. Writing review `ccauth collab review <files...> -o review.md`, report translation `ccauth collab explain <files...> -o summary.md`, ideas `ccauth collab ideas <context files...> -o ideas.md [--search]`, each optionally with `--note "extra instruction"`.
+4. Writing review `ccauth collab review <files...> -o review.md [--venue ICML]` (--venue adds a full review on that venue's form), report translation `ccauth collab explain <files...> -o summary.md`, ideas `ccauth collab ideas <context files...> -o ideas.md [--search]`, each optionally with `--note "extra instruction"`.
 5. Reject suggestions that change numbers, citations, formulas, macros, terms or the strength of a claim. Its ideas are options; you decide what to adopt.
 """
 
@@ -3885,6 +3885,10 @@ COLLAB_REVIEW_EN = """You review academic writing. The user gives a complete man
 Format: list the points in reading order. Each point gives the location (section name or the first words of the paragraph), the original sentence, the problem, and a suggested fix as a full rewritten sentence. End with three to five global points on structure, logical flow and consistent terms. If two language versions are given, check that they match.
 Check: whether each step of the argument follows from the previous one; whether sentences are clear with an explicit subject, verb and object; consistent terms; AI-sounding or mannered prose, including dashes, semicolons, explanatory colons, rhetorical fragments, forced parallels, suspense set-ups, "not A but B" contrasts, grand closing lines, personification and empty transitions; divisions written with a slash.
 Do not suggest changes to numbers, citations, formulas, LaTeX macros or the strength of claims, and do not suggest adding new content, defensive caveats or engineering details."""
+
+COLLAB_VENUE_ZH = """你同时以 {venue} 的资深审稿人身份审读。先按 {venue} 的审稿表给出一份完整评审：总结、主要贡献、优点、缺点（按严重程度排序）、给作者的问题、建议分数与理由。缺点要具体到章节、定义、定理或实验，并给出修改办法。然后再给逐条写作意见。按 {venue} 的版式与写作惯例检查结构、篇幅分配、图表与正文的对应、相关工作的覆盖与定位。"""
+
+COLLAB_VENUE_EN = """Also review as a senior reviewer for {venue}. First give a complete review following the {venue} review form: summary, main contributions, strengths, weaknesses ranked by severity, questions to the authors, and a recommended score with reasons. Make each weakness specific to a section, definition, theorem or experiment, and say how to fix it. Then give the sentence-level writing points. Check structure, allocation of space, correspondence between figures, tables and text, and the coverage and positioning of related work against {venue} conventions."""
 
 COLLAB_EXPLAIN_ZH = """下面是执行代理写的工作汇报，里面有大量工程术语和限定句。把它翻译成作者一读就懂的简体中文摘要，用 Markdown 输出，只写四部分：已完成的结果（关键数字照抄并说明含义）、正在进行的工作、遇到的问题、需要作者或 Claude 决定的事。去掉哈希值、进程号、路径细节和重复的限定句，不添加原文没有的信息，不评价好坏。"""
 
@@ -4065,7 +4069,7 @@ def collab_pick_account(prov, st, force=False):
             "确需发送加 --force，或用 ccauth collab reserve <美元> 调整保留线")
 
 
-def collab_call(task, files, out, note, model=None, provider=None, search=False, force=False):
+def collab_call(task, files, out, note, model=None, provider=None, search=False, force=False, venue=None):
     st = collab_state()
     pname = provider or collab_provider_name(st)
     if not pname or pname not in agy_provider_names():
@@ -4085,6 +4089,8 @@ def collab_call(task, files, out, note, model=None, provider=None, search=False,
     system = {"review": COLLAB_REVIEW_ZH if zh else COLLAB_REVIEW_EN,
               "explain": COLLAB_EXPLAIN_ZH if zh else COLLAB_EXPLAIN_EN,
               "ideas": COLLAB_IDEAS_ZH if zh else COLLAB_IDEAS_EN}[task]
+    if venue and task == "review":
+        system += "\n" + (COLLAB_VENUE_ZH if zh else COLLAB_VENUE_EN).format(venue=venue)
     text = "\n\n".join(parts)
     if note:
         text = (tt("Extra instruction: ", "额外要求：") + note + "\n\n" + text)
@@ -4165,7 +4171,7 @@ def collab_main(argv):
     usage = tt("""ccauth collab - Claude decides, a Codex executor (sol) executes and audits, a Gemini writer (neon) reviews writing
 
   ccauth collab on | off | status
-  ccauth collab review <file...> [-o out.md] [--note "..."] [--model M] [--provider P]
+  ccauth collab review <file...> [-o out.md] [--venue ICML] [--note "..."] [--model M] [--provider P]
   ccauth collab explain <file...> [-o out.md] [--note "..."]
   ccauth collab ideas <file...> [-o out.md] [--note "..."] [--search]
   ccauth collab executor <model>[,<alternative>...]     e.g. gpt-6.1-sol,gpt-6-astra
@@ -4177,7 +4183,7 @@ review, explain and ideas send all files in one request and return Markdown.""",
                """ccauth collab - 协作模式：Claude 决策，Codex 执行代理 sol 执行与审计，Gemini 写作模型 neon 审读写作
 
   ccauth collab on | off | status
-  ccauth collab review <文件...> [-o 意见.md] [--note "额外要求"] [--model 模型] [--provider 中转站]
+  ccauth collab review <文件...> [-o 意见.md] [--venue ICML] [--note "额外要求"] [--model 模型] [--provider 中转站]
   ccauth collab explain <文件...> [-o 摘要.md] [--note "额外要求"]
   ccauth collab ideas <文件...> [-o 思路.md] [--note "额外要求"] [--search]
   ccauth collab executor <模型>[,<备选>...]       例如 gpt-6.1-sol,gpt-6-astra
@@ -4233,8 +4239,9 @@ review、explain、ideas 都把全部文件放进一次请求发出，返回 Mar
         note = _opt(rest, "--note")
         model = _opt(rest, "--model")
         provider = _opt(rest, "--provider")
+        venue = _opt(rest, "--venue")
         files = list(rest)
-        collab_call(cmd, files, out, note, model, provider, search, force)
+        collab_call(cmd, files, out, note, model, provider, search, force, venue)
     else:
         print(usage)
         sys.exit(1)
