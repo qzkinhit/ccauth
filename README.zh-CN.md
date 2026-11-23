@@ -257,7 +257,7 @@ ccauth codex off                      # 恢复 CC Switch 写入的配置
 
 ## 协作模式：Claude 决策，Codex 执行，Gemini 审读写作
 
-三个代理分工处理同一个项目。Claude 做决策、定优化方向、执笔论文与文档。Codex 的执行代理（例如 gpt-6.1-sol）跑实验、写代码、审计，并在任务书给定的目标内优化。Gemini 写作模型（默认 gemini-4-neon-xhigh）审读稿件，并把执行代理的汇报翻译成人话。
+三个模型分工处理同一个项目。Claude 做决策、定优化方向、写方法核心代码、执笔论文与文档，并对用户负责。Codex 的执行代理（生产力模型，默认 gpt-6.1-sol，备选 gpt-6-astra）写实验脚本、调参、跑实验与审计。Gemini 写作模型（创意模型，默认 gemini-4-neon-xhigh，额度不够时依次换 gemini-4-argon-high、gemini-4-hydrogen-xhigh）审读稿件、出 idea，并把执行代理的汇报翻译成人话。
 
 ```
 ccauth collab on                      # 写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md 中带标记的一节
@@ -265,10 +265,13 @@ ccauth collab off                     # 删除这两节，其余内容不动
 ccauth collab status                  # 开关、写作模型、今天的调用次数
 ccauth collab review a.tex b.tex -o review.md     # 全部文件一次发出，返回 Markdown 审读意见
 ccauth collab explain STATUS.md -o summary.md     # 把执行代理的汇报翻译成人话
+ccauth collab ideas context.md -o ideas.md --search   # 出 idea 与优化方向，--search 联网检索
+ccauth collab executor gpt-6.1-sol,gpt-6-astra    # 执行代理及备选
+ccauth collab writers gemini-4-neon-xhigh,gemini-4-argon-high   # 写作模型顺序
 ccauth collab model gemini-4-neon-xhigh           # 换写作模型；provider <名字> 换中转站
 ```
 
-写作模型走 agy 中转站的原生 Gemini 接口，每条 review 或 explain 命令只发一个请求，适合按次计费的中转站。每次调用记在 `~/.ccauth/collab_calls.jsonl`。macOS 软件的 Codex 页有对应开关。
+写作模型走 agy 中转站的原生 Gemini 接口，每条 review 或 explain 命令只发一个请求，适合按次计费的中转站。每次调用记在 `~/.ccauth/collab/calls.jsonl`。macOS 软件的 Codex 页有对应开关。
 
 ## macOS 软件
 

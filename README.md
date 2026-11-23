@@ -257,7 +257,7 @@ Some relays answer a system prompt that introduces itself as Codex with 429. In 
 
 ## Collaboration mode: Claude decides, Codex executes, Gemini reviews writing
 
-Three agents share one project. Claude makes the decisions, sets the optimization direction and writes the papers and documents. A Codex executor (for example gpt-6.1-sol) runs experiments, writes code, audits and optimizes within the goals of a task file. A Gemini writing model (gemini-4-neon-xhigh by default) reviews manuscripts and turns the executor's reports into plain language.
+Three models share one project. Claude makes the decisions, sets the optimization direction, writes the core code of the method, writes the papers and documents, and answers to the user. A Codex executor (the productivity model, gpt-6.1-sol by default, gpt-6-astra as the alternative) writes experiment scripts, tunes parameters, runs experiments and audits. A Gemini writer (the creative model, gemini-4-neon-xhigh by default, then gemini-4-argon-high and gemini-4-hydrogen-xhigh when quota runs out) reviews manuscripts, proposes ideas and turns the executor's reports into plain language.
 
 ```
 ccauth collab on                      # write a marked section into ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md
@@ -265,10 +265,13 @@ ccauth collab off                     # remove both sections, leave the rest unt
 ccauth collab status                  # switch, writing model, requests today
 ccauth collab review a.tex b.tex -o review.md     # all files in one request, Markdown review back
 ccauth collab explain STATUS.md -o summary.md     # plain-language summary of an executor report
+ccauth collab ideas context.md -o ideas.md --search   # ideas and optimization directions, --search for recent work
+ccauth collab executor gpt-6.1-sol,gpt-6-astra    # executor and alternatives
+ccauth collab writers gemini-4-neon-xhigh,gemini-4-argon-high   # writer order
 ccauth collab model gemini-4-neon-xhigh           # change the writing model; provider <name> changes the relay
 ```
 
-The writing model is called through the plain Gemini API of an agy relay. Every review or explain command sends exactly one request, which suits relays that bill per call. Each call is logged in `~/.ccauth/collab_calls.jsonl`. The macOS app has the switch on its Codex page.
+The writing model is called through the plain Gemini API of an agy relay. Every review or explain command sends exactly one request, which suits relays that bill per call. Each call is logged in `~/.ccauth/collab/calls.jsonl`. The macOS app has the switch on its Codex page.
 
 ## macOS app
 

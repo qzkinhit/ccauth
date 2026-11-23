@@ -20,6 +20,11 @@ struct CollabState: Decodable {
     var enabled: Bool
     var provider: String?
     var model: String?
+    var writers: [String]?
+    var writer_options: [String]?
+    var executor: String?
+    var executor_alt: [String]?
+    var executor_options: [String]?
 }
 
 struct Accounts: Decodable {
@@ -462,9 +467,18 @@ struct CodexView: View {
                 Section {
                     Toggle("开启协作模式", isOn: Binding(get: { c.enabled },
                                                    set: { store.run(["collab", $0 ? "on" : "off"]) }))
-                    LabeledContent("写作模型") { Text("\(c.model ?? "?")（\(c.provider ?? "?")）") }
+                    Picker("执行代理（生产力模型）", selection: Binding(get: { c.executor ?? "gpt-6.1-sol" },
+                                                         set: { v in store.run(["collab", "executor", ([v] + (c.executor_options ?? []).filter { $0 != v }).joined(separator: ",")]) })) {
+                        ForEach(c.executor_options ?? [c.executor ?? "gpt-6.1-sol"], id: \.self) { Text($0).tag($0) }
+                    }
+                    Picker("写作模型（创意模型）", selection: Binding(get: { c.model ?? "gemini-4-neon-xhigh" },
+                                                         set: { v in store.run(["collab", "writers", ([v] + (c.writers ?? []).filter { $0 != v }).joined(separator: ",")]) })) {
+                        ForEach(c.writer_options ?? [c.model ?? "gemini-4-neon-xhigh"], id: \.self) { Text($0).tag($0) }
+                    }
+                    LabeledContent("写作模型顺序") { Text((c.writers ?? []).joined(separator: " → ")).foregroundStyle(.secondary) }
+                    LabeledContent("写作中转站") { Text(c.provider ?? "?") }
                 } header: { Text("协作模式") } footer: {
-                    Text("Claude 做决策和主要优化方向，Codex 的 sol 执行、审计与优化，写作模型审读稿件并把 sol 的汇报翻译成人话。开启后写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，关闭时删除，对新开的会话生效。写作模型按次计费，每次审读只发一个请求。").font(.caption).foregroundStyle(.secondary)
+                    Text("Claude 做决策、写核心代码并对你汇报；执行代理写实验脚本、调参、跑实验与审计；写作模型审读稿件、出 idea、把执行代理的汇报翻译成人话。开启后写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，关闭时删除，对新开的会话生效。写作模型按次计费，每次只发一个请求，前一个额度不够时自动换下一个。").font(.caption).foregroundStyle(.secondary)
                 }
             }
         }

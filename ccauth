@@ -3828,49 +3828,52 @@ def codex_main(argv):
 COLLAB_BEGIN = "<!-- ccauth collab: begin -->"
 COLLAB_END = "<!-- ccauth collab: end -->"
 COLLAB_DEFAULT_MODEL = "gemini-4-neon-xhigh"
+COLLAB_DEFAULT_WRITER_ALT = ["gemini-4-argon-high", "gemini-4-hydrogen-xhigh"]
+COLLAB_DEFAULT_EXECUTOR = "gpt-6.1-sol"
+COLLAB_DEFAULT_EXECUTOR_ALT = ["gpt-6-astra"]
 
 COLLAB_CLAUDE_ZH = """## 协作模式（由 ccauth collab 开启，关闭时本节自动删除）
 
-三方分工：
-- Claude（你）做决策，定主要优化方向，审核结果，执笔并修改论文与文档。
-- Codex 的执行代理 sol（gpt-6.1-sol）执行实验、写代码、审计，并在任务书给定的目标内优化。它从任务书文件接收指令，用状态文件汇报。
-- 写作模型 neon（{model}，经 {provider} 中转）审读论文与文档并给出润色意见，也把 sol 的汇报翻译成用户读得懂的中文。
+分工：两个模型给你打下手，你做决策，最终向用户汇报并对用户负责。
+- 执行代理（Codex，当前 {executor}，备选 {exec_alt}）是生产力模型。写代码和审核能力强，负责实验脚本、参数搜索与调优、跑实验、收集结果和审计。它的短处是不说人话、过度防御谨慎、汇报避重就轻。它的汇报要经过你或写作模型转述后再给用户，并且你要直接核对原始结果文件，不能只信它的汇报。
+- 写作模型（Gemini，当前 {writer}，额度不够时依次换 {writer_alt}）是创意模型。写作强，想 idea 强，世界知识丰富，负责审读论文与文档、出 idea 与优化方向、把执行代理的汇报翻译成人话。
+- 你（Claude）定主要优化方向，亲自写方法的核心代码，取舍两边的产出，执笔并修改论文与文档。执行代理通过任务书文件接收指令，通过状态文件汇报。你自己也不写防御性的话，给用户的汇报先说结论和数字，坏结果照实说。
 
-调用 neon 的规则（中转站按次计费，每次命令只发一个请求）：
-1. 一次把要审的全部内容发过去，例如整篇论文、整份文档或整份汇报，不要按段落分多次发。
-2. 只让 neon 返回审读意见 md，由你逐条核对后自己改稿落盘，不让 neon 重写全文或替你写文件。
-3. 不频繁调用。一篇稿子在定稿前或大改后调一次，sol 的汇报只在要转述给用户时调一次。
-4. 写作审读用 `ccauth collab review <文件...> -o <意见.md>`，翻译 sol 汇报用 `ccauth collab explain <文件...> -o <摘要.md>`，可加 `--note "额外要求"`。
-5. 不采纳改动数字、引用、公式、宏、术语或论断强度的建议。
+调用写作模型的规则（中转站按次计费，每条命令只发一个请求）：
+1. 一次把全部内容发过去，例如整篇论文、整份文档或整份汇报，不要按段落分多次发。每次请求尽量多装内容，能合并的任务合并进同一次请求，例如把中英两版、相关的汇报和要问的 idea 放在一起，用 --note 写清各项要求。
+2. 只让它返回 Markdown 意见，由你逐条核对后自己改稿落盘，不让它重写全文或替你写文件。
+3. 不频繁调用。一篇稿子在定稿前或大改后调一次，执行代理的汇报只在要转述给用户时调一次，出 idea 只在遇到瓶颈或定新方向时调一次。
+4. 写作审读 `ccauth collab review <文件...> -o 意见.md`，翻译汇报 `ccauth collab explain <文件...> -o 摘要.md`，出 idea `ccauth collab ideas <背景与结果文件...> -o 思路.md [--search]`，都可加 `--note "额外要求"`。
+5. 不采纳改动数字、引用、公式、宏、术语或论断强度的建议。它给的 idea 是选项，采纳与否由你决定。
 """
 
 COLLAB_CLAUDE_EN = """## Collaboration mode (turned on by ccauth collab; this section is removed when it is turned off)
 
-Roles:
-- Claude (you) makes the decisions, sets the main optimization direction, reviews results, and writes and revises papers and documents.
-- The Codex executor sol (gpt-6.1-sol) runs experiments, writes code, audits, and optimizes within the goals of the task file. It takes instructions from the task file and reports in its status file.
-- The writing model neon ({model}, through the {provider} relay) reviews papers and documents with editing suggestions, and translates sol's reports into plain language for the user.
+Division of labour: two models assist you, you make the decisions, and you report to the user and answer to the user.
+- The executor (Codex, now {executor}, alternative {exec_alt}) is the productivity model. It codes and audits well, and handles experiment scripts, parameter search and tuning, running experiments, collecting results and auditing. Its weaknesses are jargon, over-defensive caution and reports that play down bad news. Its reports reach the user only after you or the writer restate them, and you check the raw result files yourself instead of trusting the report.
+- The writer (Gemini, now {writer}, then {writer_alt} when quota runs out) is the creative model. It writes well, generates ideas well and has broad world knowledge. It reviews papers and documents, proposes ideas and optimization directions, and translates the executor's reports into plain language.
+- You (Claude) set the main optimization direction, write the core code of the method yourself, choose among what the two produce, and write and revise the papers and documents. The executor takes instructions from the task file and reports in its status file. Do not write defensively yourself either: report conclusions and numbers first, and state bad results plainly.
 
-Rules for calling neon (the relay bills per request; every command sends exactly one request):
-1. Send everything to be reviewed at once, such as a whole paper, document or report. Do not send it paragraph by paragraph.
-2. Ask neon only for a review in Markdown. Check each point yourself and make the edits yourself. Do not let neon rewrite the whole text or write files.
-3. Call it rarely: once per manuscript before it is finalized or after a major revision, and once per sol report that you need to relay to the user.
-4. Use `ccauth collab review <files...> -o <review.md>` for writing review and `ccauth collab explain <files...> -o <summary.md>` for sol reports, optionally with `--note "extra instruction"`.
-5. Reject any suggestion that changes numbers, citations, formulas, macros, terms or the strength of a claim.
+Rules for calling the writer (the relay bills per request; every command sends exactly one request):
+1. Send everything at once, such as a whole paper, document or report. Do not send it paragraph by paragraph. Pack as much as possible into each request and merge tasks that can share one request, for example both language versions, the related reports and the ideas you want, with each requirement stated in --note.
+2. Ask only for Markdown feedback. Check each point and make the edits yourself. Do not let it rewrite the whole text or write files.
+3. Call it rarely: once per manuscript before it is finalized or after a major revision, once per executor report you need to relay, and once per bottleneck or new direction for ideas.
+4. Writing review `ccauth collab review <files...> -o review.md`, report translation `ccauth collab explain <files...> -o summary.md`, ideas `ccauth collab ideas <context files...> -o ideas.md [--search]`, each optionally with `--note "extra instruction"`.
+5. Reject suggestions that change numbers, citations, formulas, macros, terms or the strength of a claim. Its ideas are options; you decide what to adopt.
 """
 
 COLLAB_CODEX_ZH = """## 协作模式（由 ccauth collab 开启，关闭时本节自动删除）
 
-你作为执行代理 sol 处理 Claude 写的任务书时，负责执行、审计与优化：按任务书跑实验、写代码、核验结果，并在任务书给定的目标内自行优化。决策与优化方向以任务书为准，论文与文档由 Claude 执笔，你不改。
+你作为执行代理处理 Claude 写的任务书时，负责实验脚本、参数搜索与调优、跑实验、收集结果与审计。方法的核心代码由 Claude 编写，你发现核心代码的问题时写进汇报并给出最小复现，不自行重写核心逻辑。决策与优化方向以任务书为准，论文与文档由 Claude 执笔，你不改。
 
-汇报要让作者一读就懂。状态文件只写四块：结果表（每个数注明来源文件）、在跑的作业、下一步、需要决定的问题。哈希、进程号、步数账目等留档细节放附属文件，正文不写“不能据此声明”“不证明”“仅作探索”之类的限定句，同一条规则不在每份报告里复述。开发期核验到结果能复算为止，独立重放只在最终运行上做一次。
+汇报要让作者一读就懂，坏结果放在前面照实写，不避重就轻。状态文件只写四块：结果表（每个数注明来源文件）、在跑的作业、下一步、需要决定的问题。哈希、进程号、步数账目等留档细节放附属文件，正文不写“不能据此声明”“不证明”“仅作探索”之类的限定句，同一条规则不在每份报告里复述。开发期核验到结果能复算为止，独立重放只在最终运行上做一次。
 """
 
 COLLAB_CODEX_EN = """## Collaboration mode (turned on by ccauth collab; this section is removed when it is turned off)
 
-When you act as the executor sol on a task file written by Claude, you execute, audit and optimize: run the experiments, write the code, verify the results, and optimize within the goals of the task file. Decisions and optimization direction come from the task file. Claude writes the papers and documents, and you do not edit them.
+When you act as the executor on a task file written by Claude, you handle experiment scripts, parameter search and tuning, running experiments, collecting results and auditing. Claude writes the core code of the method. When you find a problem in the core code, report it with a minimal reproduction instead of rewriting the core logic yourself. Decisions and optimization direction come from the task file. Claude writes the papers and documents, and you do not edit them.
 
-Reports must be readable at first sight. The status file has four parts only: a results table with the source file of every number, the running jobs, the next steps, and the questions that need a decision. Hashes, process ids, step ledgers and other records go into side files. Do not write qualifiers such as "this cannot be claimed" or "exploratory only", and do not restate the same rule in every report. During development, verification stops once a result can be recomputed. Independent replays are done once, on the final runs.
+Reports must be readable at first sight. Put bad results first and state them plainly; do not play them down. The status file has four parts only: a results table with the source file of every number, the running jobs, the next steps, and the questions that need a decision. Hashes, process ids, step ledgers and other records go into side files. Do not write qualifiers such as "this cannot be claimed" or "exploratory only", and do not restate the same rule in every report. During development, verification stops once a result can be recomputed. Independent replays are done once, on the final runs.
 """
 
 COLLAB_REVIEW_ZH = """你是学术写作审读者。用户给出一份完整的稿件或文档。通读全文后给出审读意见，用 Markdown 输出，不要重写全文。
@@ -3885,15 +3888,24 @@ Do not suggest changes to numbers, citations, formulas, LaTeX macros or the stre
 
 COLLAB_EXPLAIN_ZH = """下面是执行代理写的工作汇报，里面有大量工程术语和限定句。把它翻译成作者一读就懂的简体中文摘要，用 Markdown 输出，只写四部分：已完成的结果（关键数字照抄并说明含义）、正在进行的工作、遇到的问题、需要作者或 Claude 决定的事。去掉哈希值、进程号、路径细节和重复的限定句，不添加原文没有的信息，不评价好坏。"""
 
+COLLAB_IDEAS_ZH = """你是研究顾问。用户给出项目的背景、目标、当前结果与瓶颈。提出具体、可验证的改进思路与优化方向，用 Markdown 输出，按预期收益从高到低排序，给五到八条。每条写明：动机（针对哪个瓶颈、为什么有效）、做法（具体到可以实现）、对照与判定标准（只用验证集）、预期效果、风险与代价。可以借鉴近期方法，借鉴时写出处（标题、年份、链接）。不要泛泛而谈，不要建议用测试集挑选配置，不要建议按数据集名写特例。你只提供选项，最终决策由 Claude 做。"""
+
+COLLAB_IDEAS_EN = """You are a research advisor. The user gives the background, goals, current results and bottlenecks of a project. Propose concrete, testable improvements and optimization directions in Markdown, five to eight items ranked by expected gain. For each give: the motivation (which bottleneck, why it should help), the method in implementable detail, the control and the decision rule (validation data only), the expected effect, and the risks and costs. You may borrow from recent work; cite the source (title, year, link) when you do. Stay specific. Never suggest selecting configurations on the test set or writing dataset-specific special cases. You only offer options; Claude makes the final decision."""
+
 COLLAB_EXPLAIN_EN = """Below is a work report written by an executor agent, full of engineering terms and qualifiers. Turn it into a summary the author can read at first sight, in Markdown, with four parts only: finished results (copy the key numbers and say what they mean), work in progress, problems met, and decisions needed from the author or Claude. Drop hashes, process ids, path details and repeated qualifiers. Do not add anything the report does not say, and do not judge."""
 
 
+def collab_dir():
+    # its own folder: *.json files directly under ~/.ccauth are Claude account profiles
+    return os.path.join(os.path.expanduser("~/.ccauth"), "collab")
+
+
 def collab_state_file():
-    return os.path.join(store_dir_root(), "collab.json")
+    return os.path.join(collab_dir(), "state.json")
 
 
-def store_dir_root():
-    return os.path.expanduser("~/.ccauth")
+def collab_log_file():
+    return os.path.join(collab_dir(), "calls.jsonl")
 
 
 def collab_state():
@@ -3901,7 +3913,6 @@ def collab_state():
 
 
 def collab_state_save(st):
-    os.makedirs(store_dir_root(), exist_ok=True)
     _write_private(collab_state_file(), json.dumps(st, indent=2, ensure_ascii=False))
 
 
@@ -3931,6 +3942,24 @@ def collab_model(st, prov):
     return (prov or {}).get("writer") or (prov or {}).get("default") or models[-1]
 
 
+def collab_writers(st, prov):
+    """Primary writer first, then the fallbacks, without duplicates."""
+    chain = [collab_model(st, prov)] + list(st.get("writer_alt") or COLLAB_DEFAULT_WRITER_ALT)
+    out = []
+    for m in chain:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def collab_executor(st):
+    return st.get("executor") or COLLAB_DEFAULT_EXECUTOR
+
+
+def collab_executor_alt(st):
+    return [m for m in (st.get("executor_alt") or COLLAB_DEFAULT_EXECUTOR_ALT) if m != collab_executor(st)]
+
+
 def collab_strip(text):
     return re.sub(r"\n*" + re.escape(COLLAB_BEGIN) + r".*?" + re.escape(COLLAB_END) + r"\n?", "\n",
                   text, flags=re.S).rstrip("\n") + "\n"
@@ -3939,9 +3968,12 @@ def collab_strip(text):
 def collab_write_blocks(on):
     st = collab_state()
     pname = collab_provider_name(st) or "?"
-    model = collab_model(st, agy_provider(pname) if pname in agy_provider_names() else {})
+    writers = collab_writers(st, agy_provider(pname) if pname in agy_provider_names() else {})
     zh = LANG == "zh"
-    blocks = [(COLLAB_CLAUDE_ZH if zh else COLLAB_CLAUDE_EN).format(model=model, provider=pname),
+    sep = "、" if zh else ", "
+    fill = {"executor": collab_executor(st), "exec_alt": sep.join(collab_executor_alt(st)) or "-",
+            "writer": f"{writers[0]} @ {pname}", "writer_alt": sep.join(writers[1:]) or "-"}
+    blocks = [(COLLAB_CLAUDE_ZH if zh else COLLAB_CLAUDE_EN).format(**fill),
               COLLAB_CODEX_ZH if zh else COLLAB_CODEX_EN]
     for path, block in zip(collab_targets(), blocks):
         old = ""
@@ -3984,24 +4016,27 @@ def collab_status():
     pname = collab_provider_name(st)
     prov = agy_provider(pname) if pname in agy_provider_names() else {}
     calls = 0
-    log = os.path.join(store_dir_root(), "collab_calls.jsonl")
+    log = collab_log_file()
     today = datetime.now().strftime("%Y-%m-%d")
     if os.path.exists(log):
         with open(log, encoding="utf-8") as f:
             calls = sum(1 for line in f if today in line[:40])
     print(tt(f"Collaboration mode: {'on' if st.get('enabled') else 'off'}", f"协作模式：{'开' if st.get('enabled') else '关'}"))
-    print(tt(f"Writer: {collab_model(st, prov)} through {pname or '?'}", f"写作模型：{collab_model(st, prov)}（中转站 {pname or '?'}）"))
+    print(tt(f"Executor: {collab_executor(st)} (alternative: {', '.join(collab_executor_alt(st)) or '-'})",
+             f"执行代理：{collab_executor(st)}（备选 {'、'.join(collab_executor_alt(st)) or '-'}）"))
+    print(tt(f"Writer: {' > '.join(collab_writers(st, prov))} through {pname or '?'}",
+             f"写作模型：{' > '.join(collab_writers(st, prov))}（中转站 {pname or '?'}，前一个额度不够时换下一个）"))
     print(tt(f"Writer requests today: {calls}", f"今天已调用写作模型 {calls} 次"))
 
 
-def collab_call(task, files, out, note, model=None, provider=None):
+def collab_call(task, files, out, note, model=None, provider=None, search=False):
     st = collab_state()
     pname = provider or collab_provider_name(st)
     if not pname or pname not in agy_provider_names():
         agy_die("No agy provider is configured for the writer. Add one with: ccauth agy add <name> <url> <key>",
                 "没有可用的 agy 中转站，先用 ccauth agy add <名字> <地址> <key> 添加")
     prov = agy_provider(pname)
-    model = model or collab_model(st, prov)
+    chain = [model] if model else collab_writers(st, prov)
     parts = []
     for path in files:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -4010,49 +4045,80 @@ def collab_call(task, files, out, note, model=None, provider=None):
         agy_die("Give at least one file.", "至少给一个文件")
     zh = LANG == "zh"
     system = {"review": COLLAB_REVIEW_ZH if zh else COLLAB_REVIEW_EN,
-              "explain": COLLAB_EXPLAIN_ZH if zh else COLLAB_EXPLAIN_EN}[task]
+              "explain": COLLAB_EXPLAIN_ZH if zh else COLLAB_EXPLAIN_EN,
+              "ideas": COLLAB_IDEAS_ZH if zh else COLLAB_IDEAS_EN}[task]
     text = "\n\n".join(parts)
     if note:
         text = (tt("Extra instruction: ", "额外要求：") + note + "\n\n" + text)
     payload = {"systemInstruction": {"parts": [{"text": system}]},
                "contents": [{"role": "user", "parts": [{"text": text}]}],
-               "generationConfig": {"temperature": 0.3}}
-    url = prov["url"].rstrip("/") + f"/v1beta/models/{model}:generateContent"
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
-                                 headers={"Content-Type": "application/json", "x-goog-api-key": prov["key"]})
-    started = time.time()
-    record = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "task": task, "model": model,
-              "provider": pname, "chars_in": len(text)}
-    try:
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=1800) as r:
-            data = json.loads(r.read())
-        cands = data.get("candidates") or []
-        answer = "".join(p.get("text", "") for p in ((cands[0].get("content") or {}).get("parts") or [])
-                         if isinstance(p, dict) and not p.get("thought")) if cands else ""
-        if not answer:
-            raise ValueError("empty answer: " + json.dumps(data)[:300])
-        record.update(ok=True, chars_out=len(answer), seconds=round(time.time() - started, 1))
-    except urllib.error.HTTPError as e:
-        record.update(ok=False, error=f"HTTP {e.code}")
-        _collab_log(record)
-        agy_die(f"The writer request failed: HTTP {e.code} {e.read()[:300]!r}", f"写作模型请求失败：HTTP {e.code} {e.read()[:300]!r}")
-    except Exception as e:
-        record.update(ok=False, error=repr(e)[:200])
-        _collab_log(record)
-        agy_die(f"The writer request failed: {e!r}", f"写作模型请求失败：{e!r}")
+               "generationConfig": {"temperature": 0.7 if task == "ideas" else 0.3}}
+    if search:
+        payload["tools"] = [{"google_search": {}}]
+    answer, model = None, chain[0]
+    for i, model in enumerate(chain):
+        # streamed, still one request: a dropped connection keeps the part already received
+        url = prov["url"].rstrip("/") + f"/v1beta/models/{model}:streamGenerateContent?alt=sse"
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "x-goog-api-key": prov["key"]})
+        started = time.time()
+        record = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "task": task, "model": model,
+                  "provider": pname, "chars_in": len(text), "search": bool(search)}
+        try:
+            pieces, broken, last = [], None, ""
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=1800) as r:
+                try:
+                    for raw in r:
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        last = line[5:].strip()
+                        try:
+                            ev = json.loads(last)
+                        except ValueError:
+                            continue
+                        for c in (ev.get("candidates") or [])[:1]:
+                            for part in (c.get("content") or {}).get("parts") or []:
+                                if isinstance(part, dict) and not part.get("thought") and part.get("text"):
+                                    pieces.append(part["text"])
+                except Exception as e:  # connection dropped mid-stream
+                    broken = e
+            answer = "".join(pieces)
+            if not answer:
+                raise ValueError("empty answer: " + (repr(broken) if broken else last[:300]))
+            if broken:
+                answer += tt("\n\n(The connection dropped before the answer finished; the text above is the part received.)\n",
+                             "\n\n（回复中途断开，以上是已收到的部分。）\n")
+            record.update(ok=True, partial=bool(broken), chars_out=len(answer), seconds=round(time.time() - started, 1))
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read()[:300]
+            record.update(ok=False, error=f"HTTP {e.code}")
+            _collab_log(record)
+            # quota, rate limit, or a model the relay does not serve: try the next writer
+            if e.code in (402, 403, 404, 429) or agy_model_gone(e.code, body.decode("utf-8", "replace")):
+                if i + 1 < len(chain):
+                    print(tt(f"{model} unavailable (HTTP {e.code}), trying {chain[i + 1]}",
+                             f"{model} 不可用（HTTP {e.code}），改用 {chain[i + 1]}"), file=sys.stderr)
+                    continue
+            agy_die(f"The writer request failed: HTTP {e.code} {body!r}", f"写作模型请求失败：HTTP {e.code} {body!r}")
+        except Exception as e:
+            record.update(ok=False, error=repr(e)[:200])
+            _collab_log(record)
+            agy_die(f"The writer request failed: {e!r}", f"写作模型请求失败：{e!r}")
     _collab_log(record)
     if out:
         with open(out, "w", encoding="utf-8") as f:
             f.write(answer.rstrip("\n") + "\n")
-        print(tt(f"1 request to {model}; {len(text)} characters in, {len(answer)} out; written to {out}",
-                 f"已向 {model} 发 1 次请求，输入 {len(text)} 字符，输出 {len(answer)} 字符，写入 {out}"))
+        print(tt(f"Answer from {model}; {len(text)} characters in, {len(answer)} out; written to {out}",
+                 f"{model} 已回复，输入 {len(text)} 字符，输出 {len(answer)} 字符，写入 {out}"))
     else:
         print(answer)
 
 
 def _collab_log(record):
-    os.makedirs(store_dir_root(), exist_ok=True)
-    with open(os.path.join(store_dir_root(), "collab_calls.jsonl"), "a", encoding="utf-8") as f:
+    os.makedirs(collab_dir(), exist_ok=True)
+    with open(collab_log_file(), "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -4062,17 +4128,23 @@ def collab_main(argv):
   ccauth collab on | off | status
   ccauth collab review <file...> [-o out.md] [--note "..."] [--model M] [--provider P]
   ccauth collab explain <file...> [-o out.md] [--note "..."]
+  ccauth collab ideas <file...> [-o out.md] [--note "..."] [--search]
+  ccauth collab executor <model>[,<alternative>...]     e.g. gpt-6.1-sol,gpt-6-astra
+  ccauth collab writers <model>[,<fallback>...]         e.g. gemini-4-neon-xhigh,gemini-4-argon-high
   ccauth collab model <name> | provider <name>
 
-review and explain send all files in one request and return a Markdown review or summary.""",
+review, explain and ideas send all files in one request and return Markdown.""",
                """ccauth collab - 协作模式：Claude 决策，Codex 执行代理 sol 执行与审计，Gemini 写作模型 neon 审读写作
 
   ccauth collab on | off | status
   ccauth collab review <文件...> [-o 意见.md] [--note "额外要求"] [--model 模型] [--provider 中转站]
   ccauth collab explain <文件...> [-o 摘要.md] [--note "额外要求"]
+  ccauth collab ideas <文件...> [-o 思路.md] [--note "额外要求"] [--search]
+  ccauth collab executor <模型>[,<备选>...]       例如 gpt-6.1-sol,gpt-6-astra
+  ccauth collab writers <模型>[,<备用>...]        例如 gemini-4-neon-xhigh,gemini-4-argon-high（前一个额度不够时换下一个）
   ccauth collab model <模型> | provider <中转站>
 
-review 与 explain 把全部文件放进一次请求发出，返回 Markdown 审读意见或摘要。""")
+review、explain、ideas 都把全部文件放进一次请求发出，返回 Markdown。--search 让写作模型联网检索。""")
     if not argv or argv[0] in ("help", "-h", "--help"):
         print(usage)
         return
@@ -4083,6 +4155,23 @@ review 与 explain 把全部文件放进一次请求发出，返回 Markdown 审
         collab_off()
     elif cmd == "status":
         collab_status()
+    elif cmd == "executor" and rest:
+        st = collab_state()
+        names = [m.strip() for m in ",".join(rest).split(",") if m.strip()]
+        st["executor"], st["executor_alt"] = names[0], names[1:] or st.get("executor_alt") or COLLAB_DEFAULT_EXECUTOR_ALT
+        collab_state_save(st)
+        if st.get("enabled"):
+            collab_write_blocks(True)
+        print(tt(f"Executor: {collab_executor(st)} (alternative: {', '.join(collab_executor_alt(st)) or '-'})",
+                 f"执行代理已设为 {collab_executor(st)}（备选 {'、'.join(collab_executor_alt(st)) or '-'}）"))
+    elif cmd == "writers" and rest:
+        st = collab_state()
+        names = [m.strip() for m in ",".join(rest).split(",") if m.strip()]
+        st["model"], st["writer_alt"] = names[0], names[1:]
+        collab_state_save(st)
+        if st.get("enabled"):
+            collab_write_blocks(True)
+        print(tt(f"Writers in order: {' > '.join(names)}", f"写作模型顺序：{' > '.join(names)}"))
     elif cmd in ("model", "provider") and len(rest) == 1:
         st = collab_state()
         st[cmd] = rest[0]
@@ -4090,13 +4179,15 @@ review 与 explain 把全部文件放进一次请求发出，返回 Markdown 审
         if st.get("enabled"):
             collab_write_blocks(True)
         print(tt(f"Writer {cmd}: {rest[0]}", f"写作{'模型' if cmd == 'model' else '中转站'}已设为 {rest[0]}"))
-    elif cmd in ("review", "explain"):
+    elif cmd in ("review", "explain", "ideas"):
+        search = "--search" in rest
+        rest = [a for a in rest if a != "--search"]
         out = _opt(rest, "-o")
         note = _opt(rest, "--note")
         model = _opt(rest, "--model")
         provider = _opt(rest, "--provider")
         files = list(rest)
-        collab_call(cmd, files, out, note, model, provider)
+        collab_call(cmd, files, out, note, model, provider, search)
     else:
         print(usage)
         sys.exit(1)
@@ -4177,7 +4268,11 @@ def gui_collab():
     st = collab_state()
     pname = collab_provider_name(st)
     prov = (_read_json(os.path.join(agy_provider_dir(), pname + ".json"), {}) or {}) if pname else {}
-    return {"enabled": bool(st.get("enabled")), "provider": pname, "model": collab_model(st, prov)}
+    catalog = [e["slug"] for e in codex_catalog_entries(codex_catalog_path()) if not e["slug"].startswith("gemini")]
+    return {"enabled": bool(st.get("enabled")), "provider": pname, "model": collab_model(st, prov),
+            "writers": collab_writers(st, prov), "writer_options": sorted(set((prov.get("models") or []) + collab_writers(st, prov))),
+            "executor": collab_executor(st), "executor_alt": collab_executor_alt(st),
+            "executor_options": sorted(set(catalog + [collab_executor(st)] + collab_executor_alt(st)))}
 
 
 def gui_officials():
