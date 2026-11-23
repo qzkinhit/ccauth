@@ -25,6 +25,8 @@ struct CollabState: Decodable {
     var executor: String?
     var executor_alt: [String]?
     var executor_options: [String]?
+    var calls_today: Int?
+    var reserve_usd: Double?
 }
 
 struct Accounts: Decodable {
@@ -462,28 +464,51 @@ struct CodexView: View {
             } header: { Text("子代理（CC Switch 选中的公益站）") } footer: {
                 Text("派出的子代理统一使用这里的思考强度，主代理派子代理时指定的强度也会被覆盖。在 Codex 里直接选的模型和后台小模型不受影响。服务商不接受时自动降一档并记住 30 分钟。").font(.caption).foregroundStyle(.secondary)
             }
+        }
+        .formStyle(.grouped)
+        .onAppear { if s.codex.subagent != "follow" { sub = s.codex.subagent ?? "" } }
+    }
+}
 
+// MARK: - Collaboration mode
+
+struct CollabView: View {
+    @EnvironmentObject var store: Store
+    let s: AppState
+
+    var body: some View {
+        Form {
             if let c = s.collab {
                 Section {
                     Toggle("开启协作模式", isOn: Binding(get: { c.enabled },
                                                    set: { store.run(["collab", $0 ? "on" : "off"]) }))
-                    Picker("执行代理（生产力模型）", selection: Binding(get: { c.executor ?? "gpt-6.1-sol" },
-                                                         set: { v in store.run(["collab", "executor", ([v] + (c.executor_options ?? []).filter { $0 != v }).joined(separator: ",")]) })) {
+                } header: { Text("分工") } footer: {
+                    Text("Claude 做决策、写方法核心代码、执笔论文，并对你汇报和负责。执行代理是生产力模型，写实验脚本、调参、跑实验与审计。写作模型是创意模型，审读稿件、出 idea，把要给你看或要落盘的文字改成人话。开启后写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，关闭时删除，对新开的会话生效。").font(.caption).foregroundStyle(.secondary)
+                }
+                Section {
+                    Picker("执行代理", selection: Binding(get: { c.executor ?? "gpt-6.1-sol" },
+                                                    set: { v in store.run(["collab", "executor", ([v] + (c.executor_options ?? []).filter { $0 != v }).joined(separator: ",")]) })) {
                         ForEach(c.executor_options ?? [c.executor ?? "gpt-6.1-sol"], id: \.self) { Text($0).tag($0) }
                     }
-                    Picker("写作模型（创意模型）", selection: Binding(get: { c.model ?? "gemini-4-neon-xhigh" },
-                                                         set: { v in store.run(["collab", "writers", ([v] + (c.writers ?? []).filter { $0 != v }).joined(separator: ",")]) })) {
+                    LabeledContent("备选") { Text((c.executor_alt ?? []).joined(separator: "、")).foregroundStyle(.secondary) }
+                } header: { Text("执行代理（Codex）") }
+                Section {
+                    Picker("首选写作模型", selection: Binding(get: { c.model ?? "gemini-4-neon-xhigh" },
+                                                       set: { v in store.run(["collab", "writers", ([v] + (c.writers ?? []).filter { $0 != v }).joined(separator: ",")]) })) {
                         ForEach(c.writer_options ?? [c.model ?? "gemini-4-neon-xhigh"], id: \.self) { Text($0).tag($0) }
                     }
-                    LabeledContent("写作模型顺序") { Text((c.writers ?? []).joined(separator: " → ")).foregroundStyle(.secondary) }
-                    LabeledContent("写作中转站") { Text(c.provider ?? "?") }
-                } header: { Text("协作模式") } footer: {
-                    Text("Claude 做决策、写核心代码并对你汇报；执行代理写实验脚本、调参、跑实验与审计；写作模型审读稿件、出 idea、把执行代理的汇报翻译成人话。开启后写入 ~/.claude/CLAUDE.md 与 ~/.codex/AGENTS.md，关闭时删除，对新开的会话生效。写作模型按次计费，每次只发一个请求，前一个额度不够时自动换下一个。").font(.caption).foregroundStyle(.secondary)
+                    LabeledContent("额度不够时依次换") { Text((c.writers ?? []).dropFirst().joined(separator: " → ")).foregroundStyle(.secondary) }
+                    LabeledContent("中转站") { Text(c.provider ?? "?") }
+                    LabeledContent("今天已调用") { Text("\(c.calls_today ?? 0) 次") }
+                    LabeledContent("余额保留线") { Text("至少一个 key 保留 $\(Int(c.reserve_usd ?? 30))") }
+                } header: { Text("写作模型（Gemini）") } footer: {
+                    Text("中转站按次计费：每次审读、翻译或出 idea 只发一个请求，到保留线就拒绝发送。命令行用 ccauth collab review / explain / ideas。").font(.caption).foregroundStyle(.secondary)
                 }
+            } else {
+                Text("当前的 ccauth 命令没有协作模式，请更新到 1.4.0。").foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .onAppear { if s.codex.subagent != "follow" { sub = s.codex.subagent ?? "" } }
     }
 }
 
@@ -749,12 +774,13 @@ struct CodexLogView: View {
 // MARK: - Window
 
 enum Page: String, CaseIterable, Identifiable {
-    case agy, codex, codexlog, checkin, claude, gemini
+    case agy, codex, collab, codexlog, checkin, claude, gemini
     var id: String { rawValue }
     var title: String {
         switch self {
         case .agy: return "Antigravity"
         case .codex: return "Codex 分流"
+        case .collab: return "协作模式"
         case .codexlog: return "Codex 日志"
         case .checkin: return "每日签到"
         case .claude: return "Claude 账号"
@@ -765,6 +791,7 @@ enum Page: String, CaseIterable, Identifiable {
         switch self {
         case .agy: return "arrow.triangle.branch"
         case .codex: return "point.3.connected.trianglepath.dotted"
+        case .collab: return "person.3"
         case .codexlog: return "list.bullet.rectangle"
         case .checkin: return "calendar.badge.checkmark"
         case .claude: return "person.crop.circle"
@@ -789,6 +816,7 @@ struct ContentView: View {
                     switch page ?? .agy {
                     case .agy: AgyView(s: s)
                     case .codex: CodexView(s: s)
+                    case .collab: CollabView(s: s)
                     case .codexlog: CodexLogView()
                     case .checkin: CheckinView(s: s)
                     case .claude:

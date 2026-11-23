@@ -271,7 +271,7 @@ ccauth collab writers gemini-4-neon-xhigh,gemini-4-argon-high   # writer order
 ccauth collab model gemini-4-neon-xhigh           # change the writing model; provider <name> changes the relay
 ```
 
-The writing model is called through the plain Gemini API of an agy relay. Every review or explain command sends exactly one request, which suits relays that bill per call. Each call is logged in `~/.ccauth/collab/calls.jsonl`. The macOS app has the switch on its Codex page.
+The writing model is called through the plain Gemini API of an agy relay. Every review or explain command sends exactly one request, which suits relays that bill per call. Each call is logged in `~/.ccauth/collab/calls.jsonl`. The macOS app has a Collaboration page in its sidebar with the switch and the choice of executor and writer order.
 
 ## macOS app
 

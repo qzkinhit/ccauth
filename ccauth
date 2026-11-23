@@ -3901,7 +3901,7 @@ COLLAB_EXPLAIN_EN = """Below is a work report written by an executor agent, full
 
 def collab_dir():
     # its own folder: *.json files directly under ~/.ccauth are Claude account profiles
-    return os.path.join(os.path.expanduser("~/.ccauth"), "collab")
+    return os.path.join(STORE, "collab")
 
 
 def collab_state_file():
@@ -4326,7 +4326,16 @@ def gui_collab():
     return {"enabled": bool(st.get("enabled")), "provider": pname, "model": collab_model(st, prov),
             "writers": collab_writers(st, prov), "writer_options": sorted(set((prov.get("models") or []) + collab_writers(st, prov))),
             "executor": collab_executor(st), "executor_alt": collab_executor_alt(st),
-            "executor_options": sorted(set(catalog + [collab_executor(st)] + collab_executor_alt(st)))}
+            "executor_options": sorted(set(catalog + [collab_executor(st)] + collab_executor_alt(st))),
+            "calls_today": _collab_calls_today(), "reserve_usd": float(st.get("reserve_usd", 30))}
+
+
+def _collab_calls_today():
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not os.path.exists(collab_log_file()):
+        return 0
+    with open(collab_log_file(), encoding="utf-8") as f:
+        return sum(1 for line in f if today in line[:40])
 
 
 def gui_officials():

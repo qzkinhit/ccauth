@@ -271,7 +271,7 @@ ccauth collab writers gemini-4-neon-xhigh,gemini-4-argon-high   # 写作模型�
 ccauth collab model gemini-4-neon-xhigh           # 换写作模型；provider <名字> 换中转站
 ```
 
-写作模型走 agy 中转站的原生 Gemini 接口，每条 review 或 explain 命令只发一个请求，适合按次计费的中转站。每次调用记在 `~/.ccauth/collab/calls.jsonl`。macOS 软件的 Codex 页有对应开关。
+写作模型走 agy 中转站的原生 Gemini 接口，每条 review 或 explain 命令只发一个请求，适合按次计费的中转站。每次调用记在 `~/.ccauth/collab/calls.jsonl`。macOS 软件侧栏的「协作模式」页可以开关，并选择执行代理与写作模型的顺序。
 
 ## macOS 软件
 
