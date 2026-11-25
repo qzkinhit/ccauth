@@ -1488,19 +1488,29 @@ def agy_rewrite_models(data, models):
             continue
         if isinstance(v.get("quotaInfo"), dict):
             v["quotaInfo"] = {"remainingFraction": 1}
-    if "carbon" in relay_fams:
-        old = ms.pop("gemini-4-carbon-disabled", None)
-        if old and "gemini-4-carbon-high" not in ms:
-            for k in ("disabled", "tagTitle", "tagDescription"):
-                old.pop(k, None)
-            old["displayName"] = "Gemini 4 Carbon (High)"
-            old["thinkingLevel"] = 3
-            old["quotaInfo"] = {"remainingFraction": 1}
-            ms["gemini-4-carbon-high"] = old
+    # A plan without these models lists them as "<name>-disabled" with a "Paid Pro" tag.
+    # Unlock every one the relay serves under an id the bridge can map.
+    renamed = {}
+    for key in [k for k in ms if k.endswith("-disabled")]:
+        fam = _family(key)
+        if not fam or fam not in relay_fams:
+            continue
+        new_key = key[:-len("-disabled")] + "-high"
+        old = ms.pop(key)
+        renamed[key] = new_key
+        if new_key in ms or not isinstance(old, dict):
+            continue
+        for k in ("disabled", "tagTitle", "tagDescription"):
+            old.pop(k, None)
+        old["displayName"] = re.sub(r"\s*\(.*\)$", "", old.get("displayName") or new_key) + " (High)"
+        old["thinkingLevel"] = 3
+        old["quotaInfo"] = {"remainingFraction": 1}
+        ms[new_key] = old
+    if data.get("defaultAgentModelId") in renamed:
+        data["defaultAgentModelId"] = renamed[data["defaultAgentModelId"]]
     for sort in data.get("agentModelSorts") or []:
         for g in sort.get("groups") or []:
-            ids = [i if i != "gemini-4-carbon-disabled" else "gemini-4-carbon-high"
-                   for i in g.get("modelIds") or []]
+            ids = [renamed.get(i, i) for i in g.get("modelIds") or []]
             g["modelIds"] = [i for i in ids if i not in hide and i in ms]
     return data
 
