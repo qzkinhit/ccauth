@@ -1515,15 +1515,20 @@ def agy_rewrite_models(data, models):
         fam = _family(key)
         if not fam or fam not in relay_fams:
             continue
-        new_key = key[:-len("-disabled")] + "-high"
+        base = key[:-len("-disabled")]
+        # Name the entry after the thinking level the relay actually serves for this family.
+        lvl = _level(agy_map_model(base + "-high", models, "") or "") or "high"
+        new_key = f"{base}-{lvl}"
         old = ms.pop(key)
         renamed[key] = new_key
         if new_key in ms or not isinstance(old, dict):
             continue
         for k in ("disabled", "tagTitle", "tagDescription"):
             old.pop(k, None)
-        old["displayName"] = re.sub(r"\s*\(.*\)$", "", old.get("displayName") or new_key) + " (High)"
-        old["thinkingLevel"] = 3
+        names = {"minimal": "Minimal", "low": "Low", "medium": "Medium", "high": "High", "xhigh": "XHigh"}
+        old["displayName"] = (re.sub(r"\s*\(.*\)$", "", old.get("displayName") or new_key)
+                              + f" ({names.get(lvl, lvl)})")
+        old["thinkingLevel"] = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 100}.get(lvl, 3)
         old["quotaInfo"] = {"remainingFraction": 1}
         ms[new_key] = old
     if data.get("defaultAgentModelId") in renamed:
