@@ -305,7 +305,9 @@ struct AgyView: View {
                     Button("保存") { store.run(["agy", "save", accountName]); accountName = "" }
                         .disabled(accountName.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
-                Text("要再加一个账号：在 Antigravity 里退出并登录另一个 Google 账号，回到这里起个名字保存。")
+                Text("这里保存和切换的是独立版 Antigravity 与 agy 命令行的登录。要再加一个账号，在独立版 Antigravity 或 agy 里退出并登录另一个 Google 账号，回到这里起个名字保存。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Gemini app 里的 Antigravity 用的是 Gemini app 自己登录的 Google 账号，存在 Gemini app 的账号库里，这里读不到也切换不了。在 Gemini app 左下角头像菜单里切换账号。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Google 官方账号") }
 

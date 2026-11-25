@@ -1160,6 +1160,10 @@ def agy_save_session(quiet=False, name=None):
     if not quiet:
         print(tt(f"Saved the official Antigravity session as {name} ({email or '?'}).",
                  f"已保存官方 Antigravity 登录态为 {name}（{email or '?'}）"))
+        if IS_MAC:
+            print(tt("  This is the sign-in of the standalone Antigravity app and agy. Gemini.app keeps its own "
+                     "Google accounts; switch those from its avatar menu.",
+                     "  这是独立版 Antigravity 与 agy 的登录。Gemini app 的 Google 账号由它自己保存，在它的头像菜单里切换"))
     return True
 
 
