@@ -55,6 +55,7 @@ struct Agy: Decodable {
     var active: String
     var bridge: Bool
     var officials: [OfficialAccount]?
+    var show_claude: Bool?
     var session_saved: Bool
     var providers: [Provider]
     var sites: [Site]
@@ -317,6 +318,10 @@ struct AgyView: View {
                 }
                 LabeledContent("本地桥") { StatusDot(on: s.agy.bridge, onText: "运行中", offText: "未运行") }
                 LabeledContent("官方登录态") { Text(s.agy.session_saved ? "已保存" : "未保存").foregroundStyle(.secondary) }
+                Toggle("官方模式在 Gemini app 里显示 Claude", isOn: Binding(get: { s.agy.show_claude ?? false },
+                                                               set: { store.run(["agy", "show-claude", $0 ? "on" : "off"]) }))
+                Text("打开后官方模式也经过本地桥，请求原样发给 Google，只改模型列表，让 Gemini app 列出 Claude 与 GPT。用的是 Google 账号自己的额度。改完要完全退出 Gemini app 再打开。")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button("更新当前账号的登录态") { store.run(["agy", "save"]) }
                     Button("切回官方") { store.run(["agy", "use", "official"]) }
