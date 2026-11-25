@@ -1378,10 +1378,10 @@ def agy_running():
 
 # ---- relay model discovery and mapping -----------------------------------
 
-def agy_fetch_models(url, key):
+def agy_fetch_models(url, key, timeout=30):
     req = urllib.request.Request(url.rstrip("/") + "/v1/models",
                                  headers={"Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read())
     ids = [m.get("id", "") for m in data.get("data", [])]
     return sorted(i for i in ids if i.lower().startswith("gemini"))
@@ -1445,14 +1445,14 @@ def agy_model_gone(code, raw):
                                           ("no available channel", "model_not_found", "无可用渠道"))
 
 
-def agy_refresh_models(prov, force=False):
+def agy_refresh_models(prov, force=False, timeout=30):
     """Re-read the relay's model list at most every 15 minutes, or now when forced."""
     now = time.time()
     if not force and now - (prov.get("models_checked_at") or 0) < AGY_MODELS_TTL:
         return prov
     path = os.path.join(agy_provider_dir(), prov["name"] + ".json")
     try:
-        models = agy_fetch_models(prov["url"], prov["key"])
+        models = agy_fetch_models(prov["url"], prov["key"], timeout=timeout)
     except Exception:
         models = None
     disk = _read_json(path, {}) or {}
@@ -1511,7 +1511,9 @@ def agy_rewrite_models(data, models):
     for sort in data.get("agentModelSorts") or []:
         for g in sort.get("groups") or []:
             ids = [renamed.get(i, i) for i in g.get("modelIds") or []]
-            g["modelIds"] = [i for i in ids if i not in hide and i in ms]
+            # The picker lists only the families the relay serves right now.
+            g["modelIds"] = [i for i in ids if i not in hide and i in ms
+                             and (not relay_fams or _family(i) in relay_fams)]
     return data
 
 
@@ -1877,6 +1879,9 @@ def agy_bridge():
                 try:
                     obj = json.loads(raw or b"{}")
                     if op == "fetchAvailableModels":
+                        # The app asks for its model list when it opens: read the relay's list fresh.
+                        fresh = time.time() - (prov.get("models_checked_at") or 0) > 60
+                        prov = agy_refresh_models(prov, force=fresh, timeout=8)
                         obj = agy_rewrite_models(obj, prov.get("models") or [])
                     elif op == "retrieveUserQuotaSummary":
                         obj = agy_rewrite_quota(obj)
@@ -2446,6 +2451,7 @@ def acmd_use(name, account=None):
     if not IS_MAC:
         agy_die("Third-party mode for Antigravity is implemented for macOS only.",
                 "Antigravity 第三方模式目前只支持 macOS")
+    prov = agy_refresh_models(prov, force=True, timeout=15)
     st = agy_state()
     if st.get("active", "official") == "official":
         agy_save_session(quiet=True)
@@ -2463,6 +2469,7 @@ def acmd_use(name, account=None):
         time.sleep(0.25)
     print(tt(f"Switched Antigravity to {name} ({prov['url']})",
              f"Antigravity 已切到第三方 {name}（{prov['url']}）"))
+    print(tt("  Models now on the relay: ", "  中转站当前模型 ") + (", ".join(prov.get("models") or []) or "?"))
     if not agy_bridge_alive():
         print(tt(f"  Warning: the local bridge is not answering, see {agy_store()}/bridge.log",
                  f"  警告，本地桥没有响应，查看 {agy_store()}/bridge.log"))
