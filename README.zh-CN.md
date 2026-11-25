@@ -238,7 +238,7 @@ ccauth agy checkin --uninstall        # 取消自动签到
 
 ### 官方模式在 Gemini app 里显示 Claude
 
-Google 给 Gemini app 内置的 Antigravity 返回的模型列表里有 Claude 与 GPT，但 Gemini app 不显示它们。`ccauth agy show-claude on` 让官方模式也经过本地桥：请求原样发给 Google，只把模型列表里这些模型的提供方标成 Google，Gemini app 就会列出它们，用的是 Google 账号自己的额度。当前档标为不可用的模型（如 Neon、Argon）和 Opus 5.5 也会列出，标签为 Forced，能不能用由 Google 在每次请求时决定，选锁住的项时依次尝试 Google 可能使用的模型 ID。`ccauth agy show-claude off` 恢复直连。改完要完全退出 Gemini app 再打开。
+Google 给 Gemini app 内置的 Antigravity 返回的模型列表里有 Claude 与 GPT，但 Gemini app 不显示它们。`ccauth agy show-claude on` 让官方模式也经过本地桥：请求原样发给 Google，只把模型列表里这些模型的提供方标成 Google，Gemini app 就会列出它们，用的是 Google 账号自己的额度。`ccauth agy show-claude off` 恢复直连。改完要完全退出 Gemini app 再打开。
 
 ## Codex：主代理用 Gemini，子代理用 CC Switch 的服务商
 

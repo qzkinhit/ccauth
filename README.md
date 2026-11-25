@@ -238,7 +238,7 @@ Third-party mode is implemented for macOS only.
 
 ### Claude in the Gemini app, official mode
 
-The model list Google returns to the Antigravity built into the Gemini app includes Claude and GPT, but the Gemini app does not show them. `ccauth agy show-claude on` keeps official mode on the local bridge: requests go to Google unchanged, and only the model list marks those models as Google's, so the Gemini app lists them on the Google account's own quota. Models the plan lists as unavailable (such as Neon and Argon) and Opus 5.5 are listed too, tagged Forced; Google decides on each request, and for a locked entry the bridge tries the model ids Google may use in turn. `ccauth agy show-claude off` goes back to talking to Google directly. Quit and reopen the Gemini app afterwards.
+The model list Google returns to the Antigravity built into the Gemini app includes Claude and GPT, but the Gemini app does not show them. `ccauth agy show-claude on` keeps official mode on the local bridge: requests go to Google unchanged, and only the model list marks those models as Google's, so the Gemini app lists them on the Google account's own quota. `ccauth agy show-claude off` goes back to talking to Google directly. Quit and reopen the Gemini app afterwards.
 
 ## Codex: Gemini main agent, CC Switch subagents
 
