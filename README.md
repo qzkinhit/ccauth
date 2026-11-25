@@ -236,10 +236,6 @@ Some classic NewAPI sites have no check-in button and grant the bonus on the fir
 
 Third-party mode is implemented for macOS only.
 
-### Claude in the Gemini app, official mode
-
-The model list Google returns to the Antigravity built into the Gemini app includes Claude and GPT, but the Gemini app does not show them. `ccauth agy show-claude on` keeps official mode on the local bridge: requests go to Google unchanged, and only the model list marks those models as Google's, so the Gemini app lists them on the Google account's own quota. `ccauth agy show-claude off` goes back to talking to Google directly. Quit and reopen the Gemini app afterwards.
-
 ## Codex: Gemini main agent, CC Switch subagents
 
 Codex sends the main agent and its subagents to one provider per session, and role files cannot change the provider. `ccauth codex` runs a local router that splits by model name: requests for `gemini-*` go to the Gemini relay saved with `ccauth agy add`, every other model goes to the upstream CC Switch last wrote into `~/.codex/config.toml`, with the request's own Authorization header.

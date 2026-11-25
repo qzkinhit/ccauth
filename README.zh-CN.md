@@ -236,10 +236,6 @@ ccauth agy checkin --uninstall        # 取消自动签到
 
 第三方模式目前只支持 macOS。
 
-### 官方模式在 Gemini app 里显示 Claude
-
-Google 给 Gemini app 内置的 Antigravity 返回的模型列表里有 Claude 与 GPT，但 Gemini app 不显示它们。`ccauth agy show-claude on` 让官方模式也经过本地桥：请求原样发给 Google，只把模型列表里这些模型的提供方标成 Google，Gemini app 就会列出它们，用的是 Google 账号自己的额度。`ccauth agy show-claude off` 恢复直连。改完要完全退出 Gemini app 再打开。
-
 ## Codex：主代理用 Gemini，子代理用 CC Switch 的服务商
 
 Codex 同一会话里的主代理和子代理共用一个服务商，角色配置也改不了服务商。`ccauth codex` 在本机启动一个分流服务，按请求里的模型名分发：`gemini-` 开头的请求发往 `ccauth agy add` 保存的 Gemini 中转站，其余模型发往 CC Switch 最近写入 `~/.codex/config.toml` 的服务商，并沿用请求自带的认证头。

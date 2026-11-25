@@ -1349,20 +1349,6 @@ def agy_service_start():
                    capture_output=True)
 
 
-def agy_official_bridge():
-    """Official mode kept on the local bridge so the Gemini app lists Claude (ccauth agy show-claude on)."""
-    st = agy_state()
-    return IS_MAC and st.get("active", "official") == "official" and bool(st.get("official_bridge"))
-
-
-def agy_show_claude(data):
-    """Mark Claude and GPT entries as Google models so the Gemini app's picker keeps them."""
-    for v in (data.get("models") or {}).values():
-        if isinstance(v, dict) and v.get("modelProvider") in ("MODEL_PROVIDER_ANTHROPIC", "MODEL_PROVIDER_OPENAI"):
-            v["modelProvider"] = "MODEL_PROVIDER_GOOGLE"
-    return data
-
-
 def agy_service_stop():
     if not IS_MAC:
         return
@@ -1852,9 +1838,6 @@ def agy_bridge():
             op = self.path.split("?")[0].rsplit(":", 1)[-1] if ":" in self.path else ""
             prov = active()
             try:
-                if not prov and self.path.startswith("/v1internal:") and op in AGY_GEN_OPS:
-                    asked = str((json.loads(data or b"{}") or {}).get("model") or "")
-                    return self.google_pass(op, asked, data)
                 if prov and self.path.startswith("/v1internal:") and op in AGY_GEN_OPS:
                     asked = str((json.loads(data or b"{}") or {}).get("model") or "")
                     if asked and not asked.lower().startswith("gemini"):
@@ -1932,11 +1915,6 @@ def agy_bridge():
                     return self.send(code, raw, r.headers.get("Content-Type", "application/json"))
                 os.makedirs(agy_cache_dir(), exist_ok=True)
                 _write_private(cache, raw.decode("utf-8", "replace"))
-            if not prov and op == "fetchAvailableModels":
-                try:
-                    raw = json.dumps(agy_show_claude(json.loads(raw or b"{}"))).encode()
-                except ValueError:
-                    pass
             if prov:
                 try:
                     obj = json.loads(raw or b"{}")
@@ -2107,7 +2085,7 @@ def agy_bridge():
             payload = self.clean(json.loads(data or b"{}"))
             self.generate(prov, op, asked, payload, "alt=sse" in self.path, False)
 
-    if IS_MAC and (active() or agy_official_bridge()):
+    if IS_MAC and active():
         subprocess.run(["launchctl", "setenv", "CLOUD_CODE_URL", f"http://127.0.0.1:{AGY_PORT}"],
                        capture_output=True)
     log("bridge listening on", AGY_PORT)
@@ -2538,29 +2516,10 @@ def acmd_use(name, account=None):
     agy_restart_note(hooked)
 
 
-def acmd_show_claude(on):
-    st = agy_state()
-    st["official_bridge"] = on
-    agy_state_save(st)
-    if st.get("active", "official") == "official":
-        if on:
-            agy_service_start()
-        else:
-            agy_service_stop()
-    print(tt("Official mode now lists Claude in the Gemini app (through the local bridge)." if on else
-             "Official mode talks to Google directly again.",
-             "官方模式改为经本地桥，Gemini app 的模型列表会显示 Claude" if on else "官方模式恢复直连 Google"))
-    print(tt("  Quit the Gemini app completely (Cmd+Q) and open it again.",
-             "  完全退出 Gemini app（Cmd+Q）再打开后生效"))
-
-
 def acmd_use_official(account=None):
     if account:
         agy_switch_official_account(account)
-    if agy_state().get("official_bridge") and IS_MAC:
-        agy_service_start()   # requests pass to Google unchanged; only the model list is edited
-    else:
-        agy_service_stop()
+    agy_service_stop()
     agy_ids_apply("official")
     agy_cli_model_provider(False)
     agy_write_env(False)
@@ -2957,8 +2916,6 @@ def agy_main(argv):
             die("needs_arg", cmd="agy use")
         else:
             acmd_use(rest[0])
-    elif cmd == "show-claude" and len(rest) == 1 and rest[0] in ("on", "off"):
-        acmd_show_claude(rest[0] == "on")
     elif cmd in ("accounts", "officials"):
         acmd_accounts()
     elif cmd == "forget":
@@ -4444,7 +4401,7 @@ def gui_state():
         "claude": {"current": here, "profiles": claude},
         "gemini": {"current": gactive, "profiles": gem},
         "agy": {"active": st.get("active", "official"), "bridge": agy_bridge_alive(),
-                "officials": gui_officials(), "show_claude": bool(st.get("official_bridge")),
+                "officials": gui_officials(),
                 "session_saved": os.path.exists(agy_session_file()), "providers": provs, "sites": sites},
         "checkin": {"records": st.get("checkin") or {}, "scheduled": checkin_scheduled()},
         "codex": {"enabled": bool(cs.get("enabled")), "main": cs.get("main"), "subagent": cs.get("subagent"),
