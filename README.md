@@ -238,7 +238,7 @@ Third-party mode is implemented for macOS only.
 
 ### Balances
 
-`ccauth agy status` and `ccauth agy quota` query each relay key's balance live without calling a model. An unlimited key shows its total usage; the account balance is only on the website. Check-in sites such as Agent Router are queried with the saved access token, and repeat queries within 10 minutes use the cached value so the site does not ask for a captcha.
+`ccauth agy status` and `ccauth agy quota` query each relay key's balance live without calling a model. An unlimited key shows its total usage; the account balance is only on the website. Check-in sites such as Agent Router are queried with the saved access token. Sub2API sites such as chatflow are recognised when added, log in with email and password, check in by the reset time the site reports, and report their balance from the same page, and repeat queries within 10 minutes use the cached value so the site does not ask for a captcha.
 
 When a relay answers a model with "load limit reached" or an empty stream, the bridge switches to another model on the same relay and skips that model for three minutes.
 

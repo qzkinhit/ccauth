@@ -2277,9 +2277,88 @@ def agy_site_names():
     return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
 
 
+AGY_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
+
+def agy_is_sub2api(url):
+    """True for a Sub2API gateway (its public settings answer under /api/v1)."""
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/api/v1/settings/public", headers={"User-Agent": AGY_UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = _json_body(r.read())
+        return isinstance(d.get("data"), dict) and "site_name" in d["data"]
+    except Exception:
+        return False
+
+
+def agy_sub2api_call(name, path, method="GET", body=None):
+    """A Sub2API request with the saved login token; logs in again when it is missing or rejected."""
+    path_ = os.path.join(agy_sites_dir(), name + ".json")
+    site = _read_json(path_, {}) or {}
+    base = site["url"].rstrip("/")
+
+    def send(p, m, b, token):
+        h = {"Content-Type": "application/json", "User-Agent": AGY_UA}
+        if token:
+            h["Authorization"] = "Bearer " + token
+        req = urllib.request.Request(base + p, headers=h, method=m,
+                                     data=None if b is None else json.dumps(b).encode())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, _json_body(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, _json_body(e.read())
+            except Exception:
+                return e.code, {}
+
+    def login():
+        code, d = send("/api/v1/auth/login", "POST", {"email": site["username"], "password": site["password"]}, None)
+        data = d.get("data") or {}
+        if code != 200 or not data.get("access_token"):
+            raise RuntimeError(d.get("message") or f"login failed (HTTP {code})")
+        site["access_token"] = data["access_token"]
+        site["token_exp"] = time.time() + float(data.get("expires_in") or 3600) - 60
+        _write_private(path_, json.dumps(site, indent=2))
+        return site["access_token"]
+
+    token = site.get("access_token") if (site.get("token_exp") or 0) > time.time() else None
+    token = token or login()
+    code, d = send(path, method, body, token)
+    if code == 401 or d.get("code") == 401:
+        code, d = send(path, method, body, login())
+    return code, d
+
+
+def agy_sub2api_status(name):
+    code, d = agy_sub2api_call(name, "/api/checkin/status")
+    if d.get("code") != 0:
+        raise RuntimeError(d.get("message") or f"status failed (HTTP {code})")
+    return d.get("data") or {}
+
+
+def agy_sub2api_checkin(name):
+    """Sub2API sites with a check-in page that resets at a fixed time. Returns (status, awarded, balance, next reset)."""
+    st = agy_sub2api_status(name)
+    if not st.get("can_checkin"):
+        return "already", None, st.get("balance"), st.get("next_reset_at")
+    code, d = agy_sub2api_call(name, "/api/checkin", "POST")
+    if code == 409 or d.get("code") == 409:
+        st = agy_sub2api_status(name)
+        return "already", None, st.get("balance"), st.get("next_reset_at")
+    if d.get("code") != 0:
+        raise RuntimeError(d.get("message") or f"check-in failed (HTTP {code})")
+    got = (d.get("data") or {}).get("amount")
+    st = agy_sub2api_status(name)
+    return "done", float(got) if got is not None else None, st.get("balance"), st.get("next_reset_at")
+
+
 def agy_site_checkin(name):
-    """Sites that grant the daily bonus on login (classic NewAPI). Returns (status, awarded, balance)."""
+    """Sites that grant the daily bonus on login (classic NewAPI), or Sub2API check-in pages.
+    Returns (status, awarded, balance, next reset or None)."""
     site = _read_json(os.path.join(agy_sites_dir(), name + ".json"), {})
+    if site.get("mode") == "sub2api":
+        return agy_sub2api_checkin(name)
     import http.cookiejar
     base = site["url"].rstrip("/")
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -2330,7 +2409,7 @@ def agy_site_checkin(name):
         status = "done" if got is not None else "nobonus"
     me = call("/api/user/self").get("data") or {}
     bal = me.get("quota") / per if isinstance(me.get("quota"), (int, float)) else None
-    return status, got, bal
+    return status, got, bal, None
 
 
 def acmd_site(name, url, user, uid, token):
@@ -2341,6 +2420,15 @@ def acmd_site(name, url, user, uid, token):
         die("bad_name", name=name)
     if not url.startswith("http"):
         url = "https://" + url
+    if not uid and not token and agy_is_sub2api(url):
+        os.makedirs(agy_sites_dir(), exist_ok=True)
+        _write_private(os.path.join(agy_sites_dir(), name + ".json"),
+                       json.dumps({"name": name, "url": url.rstrip("/"), "username": user, "password": pw,
+                                   "mode": "sub2api"}, indent=2))
+        st = agy_sub2api_status(name)   # logs in once to check the password
+        print(tt(f"Saved Sub2API check-in site {name} ({url}); balance ${float(st.get('balance') or 0):.2f}.",
+                 f"已保存 Sub2API 签到站点 {name}（{url}），当前余额 ${float(st.get('balance') or 0):.2f}"))
+        return
     _write_private(os.path.join(agy_sites_dir(), name + ".json"),
                    json.dumps({"name": name, "url": url.rstrip("/"), "username": user, "password": pw,
                                "user_id": uid, "access_token": token, "mode": "login"}, indent=2))
@@ -2379,7 +2467,15 @@ def agy_checkin_all(names=None, force_all=False):
 
     def done_today(n):
         r = rec.get(n) or {}
-        return r.get("date") == today and r.get("status") in ("done", "already")
+        if r.get("status") not in ("done", "already"):
+            return False
+        if r.get("next_reset"):
+            # Sites with their own reset time: done until that time passes.
+            try:
+                return datetime.now().astimezone() < datetime.fromisoformat(r["next_reset"].replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        return r.get("date") == today
 
     last_host = {"host": None}
 
@@ -2398,15 +2494,17 @@ def agy_checkin_all(names=None, force_all=False):
             continue
         pace((_read_json(os.path.join(agy_sites_dir(), n + ".json"), {}) or {}).get("url", ""))
         try:
-            status, got, bal = agy_site_checkin(n)
+            status, got, bal, reset = agy_site_checkin(n)
             word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到"),
                     "nobonus": tt("logged in, but no check-in record today", "已登录，但今天没有签到记录")}[status]
+            if reset and status == "already":
+                word = tt("already checked in this round, next at ", "本轮已签到，下次 ") + reset[:16].replace("T", " ")
             gain = f" +${got:.2f}" if got else ""
             tail = (tt(", balance ", "，余额 ") + f"${bal:.2f}") if bal is not None else ""
             msg = f"{n}: {word}{gain}{tail}"
             rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "balance": bal,
                       "status": "error" if status == "nobonus" else status, "awarded": got,
-                      "error": word if status == "nobonus" else None}
+                      "error": word if status == "nobonus" else None, "next_reset": reset}
             ok = ok and status != "nobonus"
         except Exception as e:
             ok = False
@@ -2795,15 +2893,18 @@ def agy_site_balance(name, max_age=AGY_SITE_BALANCE_TTL):
     if cache.get("usd") is not None and now - cache.get("at", 0) < max_age:
         return cache["usd"], now - cache["at"], None
     site = _read_json(os.path.join(agy_sites_dir(), name + ".json"), {}) or {}
-    if not site.get("access_token"):
+    if site.get("mode") != "sub2api" and not site.get("access_token"):
         return None, None, tt("no access token saved", "没有保存访问令牌")
-    req = urllib.request.Request(site["url"].rstrip("/") + "/api/user/self",
-                                 headers={"Authorization": site["access_token"],
-                                          "New-Api-User": str(site.get("user_id", ""))})
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            me = (_json_body(r.read()) or {}).get("data") or {}
-        usd = me["quota"] / 500000.0
+        if site.get("mode") == "sub2api":
+            usd = float(agy_sub2api_status(name)["balance"])
+        else:
+            req = urllib.request.Request(site["url"].rstrip("/") + "/api/user/self",
+                                         headers={"Authorization": site["access_token"],
+                                                  "New-Api-User": str(site.get("user_id", ""))})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                me = (_json_body(r.read()) or {}).get("data") or {}
+            usd = me["quota"] / 500000.0
     except Exception as e:  # noqa: BLE001
         if cache.get("usd") is not None:
             return cache["usd"], now - cache.get("at", now), None

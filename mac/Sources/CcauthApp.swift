@@ -621,7 +621,9 @@ struct CheckinView: View {
                         stPassword = ""
                     }.disabled(stName.isEmpty || stURL.isEmpty || stUser.isEmpty || stPassword.isEmpty)
                 }
-            } header: { Text("添加登录即签到的站点（如 Agent Router）") }
+            } header: { Text("添加签到站点（Agent Router 这类登录即签到的站点，或 chatflow 这类 Sub2API 站点）") } footer: {
+                Text("Sub2API 站点会自动识别，只填名字、地址、邮箱和密码，用户 ID 和令牌留空。").font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .onAppear { if lgProvider.isEmpty { lgProvider = s.agy.providers.first?.name ?? "" } }
