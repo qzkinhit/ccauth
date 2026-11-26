@@ -2452,6 +2452,31 @@ def acmd_login(name, user):
              f"{name} 已登录 {user}（用户 ID {sess.acct.get('user_id')}），密码保存在本机配置文件（权限 600）"))
 
 
+def _transient_net_error(e):
+    """A dropped or timed-out connection, worth another try; HTTP answers and captchas are not."""
+    import ssl
+    if isinstance(e, urllib.error.HTTPError):
+        return False
+    low = str(e).lower()
+    return (isinstance(e, (ssl.SSLError, TimeoutError, ConnectionError, urllib.error.URLError))
+            or any(w in low for w in ("eof occurred", "timed out", "connection reset",
+                                       "remote end closed", "temporarily unavailable")))
+
+
+def _retry_net(fn, label, tries=3, wait=30):
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            if attempt + 1 < tries and _transient_net_error(e):
+                print(time.strftime("%Y-%m-%d %H:%M:%S"),
+                      tt(f"{label}: network error ({str(e)[:80]}), retrying in {wait}s",
+                         f"{label}：网络错误（{str(e)[:80]}），{wait} 秒后重试"), flush=True)
+                time.sleep(wait)
+                continue
+            raise
+
+
 def agy_checkin_all(names=None, force_all=False):
     sites = [n for n in agy_site_names() if not names or n in names]
     names = [n for n in (names or agy_provider_names())
@@ -2494,7 +2519,7 @@ def agy_checkin_all(names=None, force_all=False):
             continue
         pace((_read_json(os.path.join(agy_sites_dir(), n + ".json"), {}) or {}).get("url", ""))
         try:
-            status, got, bal, reset = agy_site_checkin(n)
+            status, got, bal, reset = _retry_net(lambda: agy_site_checkin(n), n)
             word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到"),
                     "nobonus": tt("logged in, but no check-in record today", "已登录，但今天没有签到记录")}[status]
             if reset and status == "already":
@@ -2519,8 +2544,10 @@ def agy_checkin_all(names=None, force_all=False):
         sess = AgySession(prov)
         stamp = datetime.now().astimezone().isoformat(timespec="seconds")
         try:
-            sess.ensure()
-            status, got, bal = sess.checkin()
+            def run():
+                sess.ensure()
+                return sess.checkin()
+            status, got, bal = _retry_net(run, n)
             sess.save()
             word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到")}[status]
             gain = f" +${got:.2f}" if got is not None else ""
