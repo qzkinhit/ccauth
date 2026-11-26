@@ -4303,21 +4303,45 @@ def collab_pick_account(prov, st, force=False):
             "确需发送加 --force，或用 ccauth collab reserve <美元> 调整保留线")
 
 
-def collab_call(task, files, out, note, model=None, provider=None, search=False, force=False, venue=None):
-    st = collab_state()
+COLLAB_MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+                ".gif": "image/gif", ".pdf": "application/pdf"}
+
+
+def collab_routes(st, model=None, provider=None):
+    """The writer attempts in order as (provider name, model, thinking level or None). collab routes sets a chain
+    across providers ("provider:model@level"); without it, or when a model or provider is forced on the command line,
+    the single provider and its writer chain are used as before."""
+    spec = st.get("writer_routes") or []
+    if spec and not model and not provider:
+        out = []
+        for r in spec:
+            name, _, rest = r.partition(":")
+            mdl, _, level = rest.partition("@")
+            out.append((name, mdl, level or None))
+        return out
     pname = provider or collab_provider_name(st)
     if not pname or pname not in agy_provider_names():
         agy_die("No agy provider is configured for the writer. Add one with: ccauth agy add <name> <url> <key>",
                 "没有可用的 agy 中转站，先用 ccauth agy add <名字> <地址> <key> 添加")
-    prov = agy_provider(pname)
-    prov, lefts = collab_pick_account(prov, st, force)
-    pname = prov.get("name", pname)
-    chain = [model] if model else collab_writers(st, prov)
-    parts = []
+    chain = [model] if model else collab_writers(st, agy_provider(pname))
+    return [(pname, m, None) for m in chain]
+
+
+def collab_call(task, files, out, note, model=None, provider=None, search=False, force=False, venue=None):
+    st = collab_state()
+    routes = collab_routes(st, model, provider)
+    use_routes = bool(st.get("writer_routes")) and not model and not provider
+    parts, media = [], []
     for path in files:
+        mime = COLLAB_MEDIA.get(os.path.splitext(path)[1].lower())
+        if mime:
+            # images and PDFs go into the same request as inlineData parts after the text
+            with open(path, "rb") as f:
+                media.append((os.path.basename(path), mime, base64.b64encode(f.read()).decode()))
+            continue
         with open(path, encoding="utf-8", errors="replace") as f:
             parts.append(f"===== {os.path.basename(path)} =====\n{f.read()}")
-    if not parts:
+    if not parts and not media:
         agy_die("Give at least one file.", "至少给一个文件")
     zh = LANG == "zh"
     system = {"review": COLLAB_REVIEW_ZH if zh else COLLAB_REVIEW_EN,
@@ -4328,20 +4352,44 @@ def collab_call(task, files, out, note, model=None, provider=None, search=False,
     text = "\n\n".join(parts)
     if note:
         text = (tt("Extra instruction: ", "额外要求：") + note + "\n\n" + text)
+    user_parts = [{"text": text}] if text else []
+    for name, mime, data in media:
+        user_parts.append({"text": f"===== {name} ({mime}) ====="})
+        user_parts.append({"inlineData": {"mimeType": mime, "data": data}})
     payload = {"systemInstruction": {"parts": [{"text": system}]},
-               "contents": [{"role": "user", "parts": [{"text": text}]}],
+               "contents": [{"role": "user", "parts": user_parts}],
                "generationConfig": {"temperature": 0.7 if task == "ideas" else 0.3}}
     if search:
         payload["tools"] = [{"google_search": {}}]
-    answer, model = None, chain[0]
-    for i, model in enumerate(chain):
+    answer, model = None, routes[0][1]
+    pname, prov, lefts = None, None, []
+    for i, (rname, model, level) in enumerate(routes):
+        if rname != pname:
+            if rname not in agy_provider_names():
+                print(tt(f"provider {rname} is not configured, skipped", f"中转站 {rname} 未配置，跳过"), file=sys.stderr)
+                continue
+            try:
+                prov, lefts = collab_pick_account(agy_provider(rname), st, force)
+            except SystemExit:
+                if use_routes and i + 1 < len(routes):
+                    print(tt(f"{rname} refused by the reserve, trying the next route",
+                             f"{rname} 到了保留线，改用下一个"), file=sys.stderr)
+                    continue
+                raise
+            pname = prov.get("name", rname)
+        gen = dict(payload["generationConfig"])
+        if level:
+            gen["thinkingConfig"] = {"thinkingLevel": level}
+        req_body = dict(payload, generationConfig=gen)
         # streamed, still one request: a dropped connection keeps the part already received
         url = prov["url"].rstrip("/") + f"/v1beta/models/{model}:streamGenerateContent?alt=sse"
-        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
-                                     headers={"Content-Type": "application/json", "x-goog-api-key": prov["key"]})
+        req = urllib.request.Request(url, data=json.dumps(req_body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "x-goog-api-key": prov["key"],
+                                              "User-Agent": "Mozilla/5.0"})
         started = time.time()
         record = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "task": task, "model": model,
-                  "provider": pname, "chars_in": len(text), "search": bool(search),
+                  "provider": pname, "thinking": level, "chars_in": len(text), "media_in": len(media),
+                  "search": bool(search),
                   "balances_before": [None if l is None else round(l, 2) for l in lefts]}
         try:
             pieces, broken, last = [], None, ""
@@ -4374,23 +4422,32 @@ def collab_call(task, files, out, note, model=None, provider=None, search=False,
             body = e.read()[:300]
             record.update(ok=False, error=f"HTTP {e.code}")
             _collab_log(record)
-            # quota, rate limit, or a model the relay does not serve: try the next writer
-            if e.code in (402, 403, 404, 429) or agy_model_gone(e.code, body.decode("utf-8", "replace")):
-                if i + 1 < len(chain):
-                    print(tt(f"{model} unavailable (HTTP {e.code}), trying {chain[i + 1]}",
-                             f"{model} 不可用（HTTP {e.code}），改用 {chain[i + 1]}"), file=sys.stderr)
+            # quota, rate limit, overload, or a model the relay does not serve: try the next writer (route mode: any
+            # failure moves on)
+            if use_routes or e.code in (402, 403, 404, 429) or agy_model_gone(e.code, body.decode("utf-8", "replace")):
+                if i + 1 < len(routes):
+                    print(tt(f"{pname}:{model} unavailable (HTTP {e.code}), trying {routes[i + 1][0]}:{routes[i + 1][1]}",
+                             f"{pname}:{model} 不可用（HTTP {e.code}），改用 {routes[i + 1][0]}:{routes[i + 1][1]}"),
+                          file=sys.stderr)
                     continue
             agy_die(f"The writer request failed: HTTP {e.code} {body!r}", f"写作模型请求失败：HTTP {e.code} {body!r}")
         except Exception as e:
             record.update(ok=False, error=repr(e)[:200])
             _collab_log(record)
+            if use_routes and i + 1 < len(routes):
+                print(tt(f"{pname}:{model} failed ({e!r}), trying the next route",
+                         f"{pname}:{model} 失败（{e!r}），改用下一个"), file=sys.stderr)
+                continue
             agy_die(f"The writer request failed: {e!r}", f"写作模型请求失败：{e!r}")
     _collab_log(record)
+    if not answer:
+        agy_die("Every writer route failed.", "所有写作路线都失败了")
     if out:
         with open(out, "w", encoding="utf-8") as f:
             f.write(answer.rstrip("\n") + "\n")
-        print(tt(f"Answer from {model}; {len(text)} characters in, {len(answer)} out; written to {out}",
-                 f"{model} 已回复，输入 {len(text)} 字符，输出 {len(answer)} 字符，写入 {out}"))
+        print(tt(f"Answer from {pname}:{model}; {len(text)} characters and {len(media)} images/PDFs in, {len(answer)} out; "
+                 f"written to {out}",
+                 f"{pname}:{model} 已回复，输入 {len(text)} 字符与 {len(media)} 个图片或 PDF，输出 {len(answer)} 字符，写入 {out}"))
     else:
         print(answer)
 
@@ -4411,6 +4468,8 @@ def collab_main(argv):
   ccauth collab lead claude|codex                        the lead model that decides and writes (default claude)
   ccauth collab executor <model>[,<alternative>...]     e.g. gpt-6.1-sol,gpt-6-astra
   ccauth collab writers <model>[,<fallback>...]         e.g. gemini-4-neon-xhigh,gemini-4-argon-high
+  ccauth collab routes <provider:model[@level]>,...|off  writer attempts across providers, e.g.
+                                                         anyrouter:gemini-4-carbon@xhigh,anyrouter:gemini-4-neon@xhigh,wududu:gemini-4-neon-xhigh
   ccauth collab reserve <dollars>                        at least one key keeps this balance (default 30)
   ccauth collab model <name> | provider <name>
 
@@ -4424,6 +4483,9 @@ review, explain and ideas send all files in one request and return Markdown.""",
   ccauth collab lead claude|codex                主模型（做决策、执笔），默认 claude
   ccauth collab executor <模型>[,<备选>...]       例如 gpt-6.1-sol,gpt-6-astra
   ccauth collab writers <模型>[,<备用>...]        例如 gemini-4-neon-xhigh,gemini-4-argon-high（前一个额度不够时换下一个）
+  ccauth collab routes <中转站:模型[@思考档位]>,...|off
+                                                跨中转站的尝试顺序，前一个失败就换下一个，例如
+                                                anyrouter:gemini-4-carbon@xhigh,anyrouter:gemini-4-neon@xhigh,wududu:gemini-4-neon-xhigh
   ccauth collab reserve <美元>                    至少一个 key 保留这么多余额（默认 30），到线就拒绝发送
   ccauth collab model <模型> | provider <中转站>
 
@@ -4455,6 +4517,20 @@ review、explain、ideas 都把全部文件放进一次请求发出，返回 Mar
         if st.get("enabled"):
             collab_write_blocks(True)
         print(tt(f"Writers in order: {' > '.join(names)}", f"写作模型顺序：{' > '.join(names)}"))
+    elif cmd == "routes" and rest:
+        st = collab_state()
+        if rest == ["off"]:
+            st["writer_routes"] = []
+            msg = tt("Writer routes off; the single provider and its writers are used.", "已关闭跨中转站路线，改回单一中转站")
+        else:
+            names = [m.strip() for m in ",".join(rest).split(",") if m.strip()]
+            bad = [r for r in names if ":" not in r]
+            if bad:
+                agy_die(f"Routes are provider:model[@level], got {bad}", f"路线格式是 中转站:模型[@思考档位]，这些不对：{bad}")
+            st["writer_routes"] = names
+            msg = tt(f"Writer routes in order: {' > '.join(names)}", f"写作路线顺序：{' > '.join(names)}")
+        collab_state_save(st)
+        print(msg)
     elif cmd in ("model", "provider") and len(rest) == 1:
         st = collab_state()
         st[cmd] = rest[0]
