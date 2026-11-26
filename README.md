@@ -236,6 +236,12 @@ Some classic NewAPI sites have no check-in button and grant the bonus on the fir
 
 Third-party mode is implemented for macOS only.
 
+### Balances
+
+`ccauth agy status` and `ccauth agy quota` query each relay key's balance live without calling a model. An unlimited key shows its total usage; the account balance is only on the website. Check-in sites such as Agent Router are queried with the saved access token, and repeat queries within 10 minutes use the cached value so the site does not ask for a captcha.
+
+When a relay answers a model with "load limit reached" or an empty stream, the bridge switches to another model on the same relay and skips that model for three minutes.
+
 ## Codex: Gemini main agent, CC Switch subagents
 
 Codex sends the main agent and its subagents to one provider per session, and role files cannot change the provider. `ccauth codex` runs a local router that splits by model name: requests for `gemini-*` go to the Gemini relay saved with `ccauth agy add`, every other model goes to the upstream CC Switch last wrote into `~/.codex/config.toml`, with the request's own Authorization header.

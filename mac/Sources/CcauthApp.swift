@@ -365,6 +365,7 @@ struct ProviderRow: View {
     var balance: String {
         guard let q = store.quota[p.name] else { return "余额未查询" }
         if q.error != nil { return "余额查询失败" }
+        if q.left == nil, let used = q.used { return String(format: "不限额 key，已用 $%.2f", used) }
         return String(format: "余额 $%.2f", q.left ?? 0)
     }
 
@@ -554,6 +555,8 @@ struct CheckinView: View {
                 HStack {
                     Text("当天已签的账户不再访问网站，同一站点的账户之间间隔 30 到 60 秒。").font(.caption).foregroundStyle(.secondary)
                     Spacer()
+                    Button(store.quotaLoading ? "查询中…" : "查询当前余额") { store.loadQuota() }
+                        .disabled(store.quotaLoading)
                     Button("立即签到") { store.run(["agy", "checkin"]) }.buttonStyle(.borderedProminent)
                 }
             } header: { Text("每日签到") }
@@ -561,7 +564,7 @@ struct CheckinView: View {
             Section {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
                     GridRow {
-                        ForEach(["账户", "今天", "签到奖励", "签到后余额", "时间"], id: \.self) {
+                        ForEach(["账户", "今天", "签到奖励", "签到后余额", "当前余额", "时间"], id: \.self) {
                             Text($0).foregroundStyle(.secondary)
                         }
                     }
@@ -579,6 +582,8 @@ struct CheckinView: View {
                             }
                             Text(r?.awarded.map { String(format: "+$%.2f", $0) } ?? "—")
                             Text(r?.balance.map { String(format: "$%.2f", $0) } ?? "—")
+                            Text(store.quota[n]?.left.map { String(format: "$%.2f", $0) }
+                                 ?? (store.quota[n]?.error != nil ? "查询失败" : "—"))
                             Text(shortTime(r?.at)).foregroundStyle(.secondary)
                         }
                     }

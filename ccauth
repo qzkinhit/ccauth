@@ -1445,9 +1445,41 @@ def agy_best_model(models):
 
 
 def agy_model_gone(code, raw):
+    """The relay has no channel for this model right now (withdrawn or overloaded)."""
     low = (raw or b"").decode("utf-8", "replace").lower()
-    return code in (400, 404, 503) and any(w in low for w in
-                                          ("no available channel", "model_not_found", "无可用渠道"))
+    return code in (400, 404, 500, 503) and any(w in low for w in (
+        "no available channel", "model_not_found", "无可用渠道", "get_channel_failed", "负载已经达到上限"))
+
+
+AGY_COOL_SECONDS = 180
+AGY_COOLED = {}   # (relay name, model) -> time until which the bridge skips it
+
+
+class _Raw:
+    """An already-read reply, so later code can read() it again."""
+    def __init__(self, code, data, headers=None):
+        self.status = self.code = code
+        self._d = data
+        self.headers = headers or {}
+
+    def read(self, *a):
+        d, self._d = self._d, b""
+        return d
+
+
+class _Prefixed:
+    """A streamed reply whose first lines were read ahead."""
+    def __init__(self, head, r):
+        self.head, self.r = head, r
+        self.status = self.code = 200
+        self.headers = getattr(r, "headers", {})
+
+    def __iter__(self):
+        yield from self.head
+        yield from self.r
+
+    def read(self, *a):
+        return b"".join(self.head) + self.r.read(*a)
 
 
 def agy_refresh_models(prov, force=False, timeout=30):
@@ -1525,6 +1557,11 @@ def agy_rewrite_models(data, models):
             # The picker lists only the families the relay serves right now.
             g["modelIds"] = [i for i in ids if i not in hide and i in ms
                              and (not relay_fams or i not in google or _family(i) in relay_fams)]
+    # The app opens on its default model; point it at one the relay serves.
+    shown = [i for sort in data.get("agentModelSorts") or [] for g in sort.get("groups") or []
+             for i in g.get("modelIds") or []]
+    if shown and data.get("defaultAgentModelId") not in shown:
+        data["defaultAgentModelId"] = next((i for i in shown if i in google), shown[0])
     return data
 
 
@@ -1941,6 +1978,16 @@ def agy_bridge():
             except urllib.error.HTTPError as e:
                 return e
 
+        @staticmethod
+        def peek(r):
+            """Read up to the first data line; report a stream that ends without one."""
+            head = []
+            for raw in r:
+                head.append(raw)
+                if raw.strip().startswith(b"data:"):
+                    return _Prefixed(head, r), False
+            return _Prefixed(head, r), True
+
         def stream_back(self, r, wrap):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -2014,25 +2061,41 @@ def agy_bridge():
                 kind += " +hint"
             log("relay", op, asked, "->", model, kind)
             chain = agy_chain(prov)
+
+            def cooled(cand, m):
+                return AGY_COOLED.get((cand.get("name"), m), 0) > time.time()
+
+            def other(cand, m):
+                """Another model of this relay for one that has no channel now."""
+                alt = agy_available(m, cand)
+                if alt == m or cooled(cand, alt):
+                    alt = agy_best_model([x for x in (cand.get("models") or [])
+                                          if x != m and not cooled(cand, x)])
+                return alt if alt and alt != m else None
+
             for i, cand in enumerate(chain):
                 cm = model
                 if cand is not prov and cand.get("models") and model not in cand["models"]:
                     cm = agy_map_model(model, cand["models"], cand.get("default") or cand["models"][0])
+                if cooled(cand, cm) and other(cand, cm):
+                    log("relay-skip", cm, "cooling down, using", other(cand, cm))
+                    cm = other(cand, cm)
                 r = self.relay(cand, cm, op, payload, stream)
                 raw = None
-                if code_of(r) in (400, 404, 503):
+                if code_of(r) in (400, 404, 500, 503):
                     raw = r.read()
                     if agy_model_gone(code_of(r), raw):
+                        AGY_COOLED[(cand.get("name"), cm)] = time.time() + AGY_COOL_SECONDS
                         agy_refresh_models(cand, force=True)
-                        alt = agy_available(cm, cand)
-                        if alt == cm:
-                            alt = agy_best_model([m for m in (cand.get("models") or []) if m != cm])
-                        if alt and alt != cm:
+                        alt = other(cand, cm)
+                        if alt:
                             log("relay-retry", cm, "has no channel, using", alt)
                             cm = alt
                             r = self.relay(cand, cm, op, payload, stream)
                             raw = None
-                    if raw is not None and code_of(r) != 400:
+                    if raw is not None and code_of(r) == 500:
+                        r, raw = _Raw(500, raw, r.headers), None   # handled with the other errors below
+                    elif raw is not None and code_of(r) != 400:
                         log("relay-error", code_of(r), raw[:300])
                         return self.send(code_of(r), raw)
                 if code_of(r) == 400:
@@ -2053,6 +2116,21 @@ def agy_bridge():
                         continue
                     log("relay-retry", "413 too large, removed", n, "older images" if keep_last else "images")
                     r = self.relay(cand, cm, op, payload, stream)
+                if code_of(r) == 200 and stream:
+                    r, empty = self.peek(r)
+                    if empty:
+                        # Some relays answer an overloaded model with 200 and no data.
+                        AGY_COOLED[(cand.get("name"), cm)] = time.time() + AGY_COOL_SECONDS
+                        alt = other(cand, cm)
+                        log("relay-empty", cm, "sent no data" + (", using " + alt if alt else ""))
+                        if not alt:
+                            return self.error(503, f"ccauth bridge: {cm} returned an empty reply")
+                        cm = alt
+                        r = self.relay(cand, cm, op, payload, stream)
+                        if code_of(r) == 200:
+                            r, empty = self.peek(r)
+                            if empty:
+                                return self.error(503, f"ccauth bridge: {cm} returned an empty reply")
                 if code_of(r) == 200:
                     if agy_exhausted(cand.get("name")):
                         agy_mark_exhausted(cand.get("name"), False)
@@ -2631,6 +2709,20 @@ def acmd_writer(name, model):
     print(msg)
 
 
+def _json_body(raw):
+    """JSON from a reply that may be gzip-compressed; a non-JSON page raises with a short reason."""
+    import gzip
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    try:
+        return json.loads(raw or b"{}")
+    except ValueError:
+        low = raw[:2000].lower()
+        if b"aliyun_waf" in low or b"captcha" in low or b"arg1=" in low or b"<script" in low:
+            raise RuntimeError(tt("the site asked for a browser check", "站点要求浏览器校验"))
+        raise RuntimeError(tt("unexpected non-JSON reply", "站点返回了非 JSON 内容"))
+
+
 def agy_quota_of(prov):
     """Remaining and used dollars from a NewAPI-style relay, or an error string."""
     base = prov["url"].rstrip("/")
@@ -2639,11 +2731,20 @@ def agy_quota_of(prov):
     def get(path):
         req = urllib.request.Request(base + path, headers=hdr)
         with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read())
+            return _json_body(r.read())
     try:
         tok = (get("/api/usage/token/") or {}).get("data") or {}
     except Exception as e:
-        return None, None, str(e)
+        # Some relays put /api behind a browser check; the key-only billing endpoints still answer.
+        try:
+            sub = get("/v1/dashboard/billing/subscription") or {}
+            cents = (get("/v1/dashboard/billing/usage") or {}).get("total_usage")
+        except Exception:
+            return None, None, str(e)
+        hard = sub.get("hard_limit_usd")
+        used = None if cents is None else cents / 100.0
+        left = None if hard is None or hard >= 1e7 or used is None else max(hard - used, 0.0)
+        return left, used, None
     used_units = tok.get("total_used") or 0
     per_dollar = 500000.0
     try:
@@ -2674,8 +2775,54 @@ def agy_quota_lines():
             out.append(f"{mark} {n:<12} {tail:<8} " + tt("query failed: ", "查询失败 ") + err)
             continue
         flag = tt("  (used up today)", "  （今日已用完）") if agy_exhausted(n) else ""
-        out.append(f"{mark} {n:<12} {tail:<8} " + tt("left", "剩余") + f" ${left:,.2f}   "
-                   + tt("used", "已用") + f" ${used:,.2f}{flag}")
+        left_s = (f" ${left:,.2f}" if left is not None else
+                  tt(" unlimited key (account balance on the website)", " 不限额 key（账户余额在网页查看）"))
+        used_s = f" ${used:,.2f}" if used is not None else " ?"
+        out.append(f"{mark} {n:<12} {tail:<8} " + tt("left", "剩余") + left_s + "   "
+                   + tt("used", "已用") + used_s + flag)
+    return out
+
+
+AGY_SITE_BALANCE_TTL = 600   # Agent Router shows a captcha after bursts of requests
+
+
+def agy_site_balance(name, max_age=AGY_SITE_BALANCE_TTL):
+    """Live account balance of a login check-in site, cached for a few minutes.
+    Returns (dollars, seconds since queried, error)."""
+    st = agy_state()
+    cache = (st.get("site_balance") or {}).get(name) or {}
+    now = time.time()
+    if cache.get("usd") is not None and now - cache.get("at", 0) < max_age:
+        return cache["usd"], now - cache["at"], None
+    site = _read_json(os.path.join(agy_sites_dir(), name + ".json"), {}) or {}
+    if not site.get("access_token"):
+        return None, None, tt("no access token saved", "没有保存访问令牌")
+    req = urllib.request.Request(site["url"].rstrip("/") + "/api/user/self",
+                                 headers={"Authorization": site["access_token"],
+                                          "New-Api-User": str(site.get("user_id", ""))})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            me = (_json_body(r.read()) or {}).get("data") or {}
+        usd = me["quota"] / 500000.0
+    except Exception as e:  # noqa: BLE001
+        if cache.get("usd") is not None:
+            return cache["usd"], now - cache.get("at", now), None
+        return None, None, str(e)[:120]
+    st = agy_state()
+    st.setdefault("site_balance", {})[name] = {"usd": usd, "at": now}
+    agy_state_save(st)
+    return usd, 0, None
+
+
+def agy_site_balance_lines():
+    out = []
+    for n in agy_site_names():
+        usd, age, err = agy_site_balance(n)
+        if err:
+            out.append(f"  {n:<12} " + tt("query failed: ", "查询失败 ") + err)
+            continue
+        ago = "" if not age else tt(f"  ({int(age // 60)} min ago)", f"  （{int(age // 60)} 分钟前）")
+        out.append(f"  {n:<12} " + tt("balance", "余额") + f" ${usd:,.2f}{ago}")
     return out
 
 
@@ -2728,6 +2875,8 @@ def acmd_quota():
         agy_die("No relays saved yet.", "还没有保存任何第三方")
     for line in agy_quota_lines():
         print(line)
+    for line in agy_site_balance_lines():
+        print(line)
 
 
 def acmd_list():
@@ -2756,6 +2905,11 @@ def agy_status_keys():
              "第三方 key 与余额（实时查询，不消耗模型调用）"))
     for line in agy_quota_lines():
         print("  " + line)
+    if agy_site_names():
+        print(tt("Check-in site balances (account, cached for 10 minutes):",
+                 "签到站点账户余额（实时查询，10 分钟内用缓存）"))
+        for line in agy_site_balance_lines():
+            print(line)
 
 
 def acmd_status():
@@ -4453,6 +4607,9 @@ def gui_quota():
         p = _read_json(os.path.join(agy_provider_dir(), n + ".json"), {}) or {}
         left, used, err = agy_quota_of(p)
         out[n] = {"left": left, "used": used, "error": err}
+    for n in agy_site_names():
+        usd, _, err = agy_site_balance(n)
+        out[n] = {"left": usd, "used": None, "error": err}
     return out
 
 

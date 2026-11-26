@@ -236,6 +236,12 @@ ccauth agy checkin --uninstall        # 取消自动签到
 
 第三方模式目前只支持 macOS。
 
+### 余额
+
+`ccauth agy status` 与 `ccauth agy quota` 实时查询各中转站 key 的余额，不调用模型。不限额的 key 显示累计用量，账户余额只能在网页上看。签到站点（如 Agent Router）用保存的访问令牌查询账户余额，10 分钟内重复查询用缓存，避免触发站点的人机验证。
+
+中转站对某个模型回「负载已经达到上限」或流式回复为空时，本地桥改用同一中转站的其他模型，并在 3 分钟内跳过该模型。
+
 ## Codex：主代理用 Gemini，子代理用 CC Switch 的服务商
 
 Codex 同一会话里的主代理和子代理共用一个服务商，角色配置也改不了服务商。`ccauth codex` 在本机启动一个分流服务，按请求里的模型名分发：`gemini-` 开头的请求发往 `ccauth agy add` 保存的 Gemini 中转站，其余模型发往 CC Switch 最近写入 `~/.codex/config.toml` 的服务商，并沿用请求自带的认证头。
