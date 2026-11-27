@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 RESERVED = {"save", "use", "list", "ls", "status", "current", "rm", "remove",
             "help", "version", "path", "gemini", "agy", "official", "codex", "state", "collab"}
