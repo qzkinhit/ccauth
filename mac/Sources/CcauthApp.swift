@@ -575,6 +575,8 @@ struct CheckinView: View {
                             Text(n).bold()
                             if r?.status == "error" {
                                 Text("失败 " + (r?.error ?? "")).foregroundStyle(.red).lineLimit(2)
+                            } else if r?.status == "wait" {
+                                Text("暂无可领").foregroundStyle(.orange)
                             } else if r?.date == today {
                                 Text("已签").foregroundStyle(.green)
                             } else {

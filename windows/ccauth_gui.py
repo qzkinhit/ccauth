@@ -275,6 +275,8 @@ class App:
             r = ck["records"].get(n) or {}
             if r.get("status") == "error":
                 day = "失败 " + (r.get("error") or "")
+            elif r.get("status") == "wait":
+                day = "暂无可领"
             elif r.get("date") == today:
                 day = "已签"
             else:

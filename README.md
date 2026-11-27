@@ -234,6 +234,8 @@ The refresh cookie is exchanged for a short-lived token on each run. It expires 
 
 Some classic NewAPI sites have no check-in button and grant the bonus on the first login of the day. Add them with `ccauth agy site <name> <url> <username> <user_id> [access_token]`. A run first reads the quota log with the access token and skips the site if today's bonus is already there, otherwise logs in once with the password and reads the log again to report the amount. Accounts created through a third-party login need a password set on the site first.
 
+Some NewAPI sites put `/api` behind an Aliyun JavaScript browser check, so a plain request only gets the check page. Add them with `ccauth agy site <name> <url> --browser`: ccauth creates a Chrome profile for the site (`~/.ccauth/agy/browser/<name>`) and opens the site's login page in a Chrome window, where a third-party login such as LinuxDO works; the window closes once the login cookie appears. Check-ins then start a headless Chrome on the same profile, let the browser pass the check, and call the check-in endpoint from the page, with no site password. The first use installs Playwright into `~/.ccauth/browser-venv` and drives the installed Chrome or Edge. A reply with a message means a bonus was granted; an empty reply means none is due now, for example because the site's console already checked in when you opened it today, and the run is recorded as nothing due and tried again at the next scheduled time. When the 24-hour mark since the last check-in is less than 30 minutes away, the run waits for it. The login session expires after about 30 days; check-ins then report an expired login, and running the same command again logs in.
+
 Third-party mode is implemented for macOS only.
 
 ### Balances

@@ -2359,6 +2359,8 @@ def agy_site_checkin(name):
     site = _read_json(os.path.join(agy_sites_dir(), name + ".json"), {})
     if site.get("mode") == "sub2api":
         return agy_sub2api_checkin(name)
+    if site.get("mode") == "browser":
+        return agy_browser_checkin(name)
     import http.cookiejar
     base = site["url"].rstrip("/")
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -2410,6 +2412,341 @@ def agy_site_checkin(name):
     me = call("/api/user/self").get("data") or {}
     bal = me.get("quota") / per if isinstance(me.get("quota"), (int, float)) else None
     return status, got, bal, None
+
+
+# Runs inside ccauth's private Playwright environment with the site's own Chrome profile. The page loads
+# <site>/api/status, the site's JavaScript browser check sets its cookie, and every later request is a
+# fetch() from that page, so it carries the login session saved in the profile.
+AGY_BROWSER_HELPER = r'''
+import json, sys, time
+from playwright.sync_api import sync_playwright
+
+url, profile = sys.argv[1].rstrip("/"), sys.argv[2]
+state = sys.argv[3] if len(sys.argv) > 3 else ""
+
+
+def out(o):
+    sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+with sync_playwright() as p:
+    ctx, errs = None, []
+    for ch in ("chrome", "msedge", None):
+        try:
+            ctx = p.chromium.launch_persistent_context(profile, channel=ch, headless=True)
+            break
+        except Exception as e:
+            errs.append(str(e).strip().splitlines()[0])
+    if ctx is None:
+        out({"error": "cannot start Chrome, Edge or Playwright Chromium: " + " | ".join(errs)})
+        sys.exit(1)
+    if state:
+        ctx.add_cookies(json.load(open(state, encoding="utf-8")))
+    pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+    try:
+        pg.goto(url + "/api/status", wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        out({"error": "cannot open the site: " + str(e).strip().splitlines()[0]})
+        ctx.close()
+        sys.exit(1)
+    ready = False
+    for _ in range(60):
+        try:
+            ready = pg.evaluate("() => !!document.body && document.body.innerText.trim().startsWith('{')")
+        except Exception:
+            ready = False
+        if ready:
+            break
+        time.sleep(1)
+    if not ready:
+        out({"error": "the browser check did not finish within 60 s"})
+        ctx.close()
+        sys.exit(1)
+    out({"ready": True, "user": pg.evaluate("() => localStorage.getItem('user')")})
+    for line in sys.stdin:
+        q = json.loads(line)
+        try:
+            r = pg.evaluate("""async (q) => {
+                const r = await fetch(q.path, {method: q.method, headers: q.headers, body: q.body || undefined});
+                return [r.status, await r.text()];
+            }""", q)
+            out({"status": r[0], "text": r[1]})
+        except Exception as e:
+            out({"error": str(e).strip().splitlines()[0]})
+    ctx.close()
+'''
+
+
+def agy_browser_python():
+    """Python of ccauth's private Playwright environment, created on first use. It drives the installed
+    Chrome or Edge, so no browser download is needed."""
+    venv = os.path.join(STORE, "browser-venv")
+    py = os.path.join(venv, "Scripts", "python.exe") if IS_WIN else os.path.join(venv, "bin", "python")
+    if os.path.exists(py) and subprocess.run([py, "-c", "import playwright"], capture_output=True).returncode == 0:
+        return py
+    print(tt("Installing Playwright into " + venv + " (one time)...",
+             "首次使用，正在把 Playwright 安装到 " + venv + " ..."), file=sys.stderr, flush=True)
+    subprocess.run([sys.executable, "-m", "venv", venv], check=True, capture_output=True)
+    r = subprocess.run([py, "-m", "pip", "install", "-q", "playwright"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(tt("installing Playwright failed: ", "安装 Playwright 失败：")
+                           + (r.stderr or r.stdout).strip()[-300:])
+    return py
+
+
+def agy_browser_profile(name):
+    return os.path.join(agy_store(), "browser", name)
+
+
+class AgyBrowser:
+    """A headless Chrome page on a site whose /api sits behind a JavaScript browser check (Aliyun WAF),
+    using the site's own profile under ~/.ccauth/agy/browser. The browser runs the check as
+    any visitor's browser would; requests then go out as fetch() calls from that page."""
+
+    def __init__(self, url, profile, state=None):
+        os.makedirs(profile, exist_ok=True)
+        cmd = [agy_browser_python(), "-I", "-c", AGY_BROWSER_HELPER, url, profile] + ([state] if state else [])
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
+        first = self._read()
+        if not first.get("ready"):
+            self.close()
+            raise RuntimeError(first.get("error") or tt("the browser exited", "浏览器意外退出"))
+        try:
+            self.user = json.loads(first.get("user") or "null") or {}
+        except ValueError:
+            self.user = {}
+
+    def _read(self):
+        line = self.p.stdout.readline()
+        if not line:
+            return {"error": tt("the browser exited", "浏览器意外退出")}
+        return json.loads(line)
+
+    def _send(self, q):
+        self.p.stdin.write(json.dumps(q) + "\n")
+        self.p.stdin.flush()
+        r = self._read()
+        if "error" in r:
+            raise RuntimeError(r["error"])
+        return r
+
+    def fetch(self, path, method="GET", headers=None, body=None):
+        """(HTTP status, reply text)."""
+        r = self._send({"path": path, "method": method, "headers": headers or {},
+                        "body": None if body is None else json.dumps(body)})
+        return r["status"], r["text"]
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            self.p.kill()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def agy_browser_call(br, site, path, method="GET"):
+    """A NewAPI request from the browser page with the saved login session."""
+    code, text = br.fetch(path, method, {"Content-Type": "application/json",
+                                         "New-Api-User": str(site.get("user_id", ""))})
+    try:
+        d = json.loads(text) if text.strip() else {}
+    except ValueError:
+        raise RuntimeError(tt("unexpected non-JSON reply", "站点返回了非 JSON 内容") + f" (HTTP {code})")
+    if code == 401:
+        raise RuntimeError(tt(f"the login has expired ({d.get('message') or 'HTTP 401'}); log in again with: "
+                              f"ccauth agy site {site.get('name')} {site.get('url')} --browser",
+                              f"登录已过期（{d.get('message') or 'HTTP 401'}），重新登录："
+                              f"ccauth agy site {site.get('name')} {site.get('url')} --browser"))
+    return d
+
+
+def agy_browser_checkin(name):
+    """NewAPI sites whose /api sits behind a browser check. The site's console calls
+    POST /api/user/sign_in on every load: a reply with a message means a bonus was granted, an empty
+    message means none is due yet (the site counts from the last check-in, which may be a visit to the
+    console). Returns (status, awarded, balance, None)."""
+    path_ = os.path.join(agy_sites_dir(), name + ".json")
+    site = _read_json(path_, {}) or {}
+    per = 500000.0
+    with AgyBrowser(site["url"], site.get("profile") or agy_browser_profile(name)) as br:
+        def quota():
+            me = agy_browser_call(br, site, "/api/user/self").get("data") or {}
+            return me.get("quota") / per if isinstance(me.get("quota"), (int, float)) else None
+
+        before = quota()
+        for attempt in range(2):
+            r = agy_browser_call(br, site, "/api/user/sign_in", "POST")
+            msg = str(r.get("message") or "")
+            if not r.get("success"):
+                if any(k in msg.lower() for k in ("already", "已签到", "已经签到", "重复签到")):
+                    msg = ""
+                else:
+                    raise RuntimeError(msg or tt("check-in failed", "签到失败") + f" ({json.dumps(r)[:120]})")
+            if msg or attempt:
+                break
+            # Runs at fixed times drift past the 24 hours since the last check-in by a few seconds;
+            # when the mark is less than 30 minutes away, wait for it instead of skipping half a day.
+            last = ((agy_state().get("checkin") or {}).get(name) or {}).get("last_done")
+            try:
+                due = datetime.fromisoformat(last).timestamp() + 86400 + 60 if last else 0
+            except ValueError:
+                due = 0
+            if not 0 < due - time.time() <= 1800:
+                break
+            time.sleep(due - time.time())
+        if not msg:
+            return "wait", None, before, None
+        time.sleep(1)
+        bal = quota()
+    got = round(bal - before, 2) if bal is not None and before is not None and bal > before else None
+    if got is None:
+        m = re.search(r"[＄$]\s*([0-9.]+)", msg)
+        got = float(m.group(1)) if m else None
+    return "done", got, bal, None
+
+
+def _chrome_binary():
+    cands = (["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+              "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"] if IS_MAC else
+             [os.path.join(os.environ.get(v, ""), *p) for v in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
+              for p in (("Google", "Chrome", "Application", "chrome.exe"),
+                        ("Microsoft", "Edge", "Application", "msedge.exe"))] if IS_WIN else
+             ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium",
+              "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge"])
+    for c in cands:
+        if c and os.path.exists(c):
+            return c
+    agy_die("Google Chrome or Microsoft Edge is needed for this site.", "这个站点需要 Google Chrome 或 Microsoft Edge")
+
+
+def _session_cookie_expiry(profile, host):
+    """Latest expiry (Chrome's microseconds since 1601) of the host's login session cookie in the
+    profile's cookie store, or 0. Read from a copy, since Chrome keeps the file open."""
+    import shutil
+    import sqlite3
+    import tempfile
+    best = 0
+    for rel in (("Default", "Network", "Cookies"), ("Default", "Cookies")):
+        db = os.path.join(profile, *rel)
+        if not os.path.exists(db):
+            continue
+        tmp = os.path.join(tempfile.mkdtemp(), "c.db")
+        try:
+            shutil.copy(db, tmp)
+            con = sqlite3.connect(tmp)
+            rows = con.execute("SELECT expires_utc FROM cookies WHERE host_key IN (?, ?) AND name = 'session'",
+                               (host, "." + host)).fetchall()
+            con.close()
+            best = max([best] + [r[0] for r in rows])
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            shutil.rmtree(os.path.dirname(tmp), ignore_errors=True)
+    return best
+
+
+def _browser_logged_in(url, profile, uid_hint=None):
+    """User ID when the profile's saved session still works on the site, else None."""
+    try:
+        with AgyBrowser(url, profile) as br:
+            uid = (br.user or {}).get("id") or uid_hint
+            if not uid:
+                return None
+            code, text = br.fetch("/api/user/self", "GET", {"New-Api-User": str(uid)})
+            return uid if code == 200 and (json.loads(text or "{}") or {}).get("success") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def acmd_site_browser(name, url, state=None):
+    """Save a check-in site reached through a browser. Without a state file a Chrome window opens on the
+    site's login page (third-party logins such as LinuxDO work there) and closes once the login cookie
+    appears; with one, the site's and LinuxDO's cookies are imported from a Playwright storage-state file."""
+    from urllib.parse import urlparse
+    if not NAME_RE.match(name):
+        die("bad_name", name=name)
+    if not url.startswith("http"):
+        url = "https://" + url
+    url = url.rstrip("/")
+    host = urlparse(url).hostname
+    profile = agy_browser_profile(name)
+    os.makedirs(profile, exist_ok=True)
+    saved = _read_json(os.path.join(agy_sites_dir(), name + ".json"), {}) or {}
+    saved_uid = saved.get("user_id") if saved.get("url", "").rstrip("/") == url else None
+    cookies_file = None
+    if state:
+        keep = (host, "linux.do")   # the site plus LinuxDO, whose login renews the site's session
+        cookies = [c for c in (_read_json(state, {}) or {}).get("cookies") or []
+                   if any(c.get("domain", "").lstrip(".") == k or c.get("domain", "").endswith("." + k)
+                          for k in keep)]
+        cookies_file = os.path.join(profile, "import.json")
+        _write_private(cookies_file, json.dumps(cookies))
+    elif _browser_logged_in(url, profile, saved_uid):
+        print(tt("The saved login still works; no need to log in again.", "保存的登录仍然有效，不用重新登录"))
+    else:
+        # A new login sets a session cookie that expires about 30 days out, later than any cookie
+        # already in the profile (including one the site has revoked early).
+        limit = max(_session_cookie_expiry(profile, host), (time.time() + 7 * 86400 + 11644473600) * 1e6)
+        p = subprocess.Popen([_chrome_binary(), "--user-data-dir=" + profile, "--use-mock-keychain",
+                              "--no-first-run", "--no-default-browser-check", url + "/login"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(tt(f"Log in to {url} in the Chrome window that opened (LinuxDO login works). "
+                 "It closes by itself once the login is saved.",
+                 f"在弹出的 Chrome 窗口里登录 {url}（可以用 LinuxDO 登录），登录保存后窗口会自动关闭"), flush=True)
+        try:
+            while p.poll() is None and _session_cookie_expiry(profile, host) <= limit:
+                time.sleep(3)
+            if p.poll() is None:
+                time.sleep(5)   # let the page store the account before Chrome closes
+                if IS_WIN:
+                    subprocess.run(["taskkill", "/PID", str(p.pid)], capture_output=True)
+                else:
+                    p.terminate()
+            p.wait(timeout=60)
+        except KeyboardInterrupt:
+            p.terminate()
+            agy_die("Cancelled.", "已取消")
+
+    def state_uid():
+        for o in (_read_json(state, {}) or {}).get("origins") or []:
+            if o.get("origin", "").rstrip("/") == url:
+                for i in o.get("localStorage") or []:
+                    if i.get("name") == "user":
+                        try:
+                            return json.loads(i["value"]).get("id")
+                        except ValueError:
+                            return None
+        return None
+
+    try:
+        with AgyBrowser(url, profile, cookies_file) as br:
+            uid = (br.user or {}).get("id") or (state_uid() if state else None) or saved_uid
+            if not uid:
+                agy_die("No login found in the browser; nothing saved.", "浏览器里没有检测到登录，未保存")
+            site = {"name": name, "url": url, "user_id": str(uid), "profile": profile, "mode": "browser"}
+            me = agy_browser_call(br, site, "/api/user/self").get("data") or {}
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        agy_die(f"Not saved: {e}", f"未保存：{e}")
+    finally:
+        if cookies_file and os.path.exists(cookies_file):
+            os.remove(cookies_file)
+    os.makedirs(agy_sites_dir(), exist_ok=True)
+    _write_private(os.path.join(agy_sites_dir(), name + ".json"), json.dumps(site, indent=2))
+    bal = me.get("quota") / 500000.0 if isinstance(me.get("quota"), (int, float)) else None
+    print(tt(f"Saved browser check-in site {name} ({url}) for {me.get('username')}"
+             + (f"; balance ${bal:.2f}." if bal is not None else "."),
+             f"已保存浏览器签到站点 {name}（{url}），账户 {me.get('username')}"
+             + (f"，当前余额 ${bal:.2f}" if bal is not None else "")))
 
 
 def acmd_site(name, url, user, uid, token):
@@ -2521,20 +2858,26 @@ def agy_checkin_all(names=None, force_all=False):
         try:
             status, got, bal, reset = _retry_net(lambda: agy_site_checkin(n), n)
             word = {"done": tt("checked in", "签到成功"), "already": tt("already checked in", "今天已签到"),
-                    "nobonus": tt("logged in, but no check-in record today", "已登录，但今天没有签到记录")}[status]
+                    "nobonus": tt("logged in, but no check-in record today", "已登录，但今天没有签到记录"),
+                    "wait": tt("no bonus due now (already taken on the website today, or under 24 hours since "
+                               "the last one); the next run tries again",
+                               "现在没有可领的签到（今天可能已在网页上领过，或离上次不足 24 小时），下次定时运行再试")}[status]
             if reset and status == "already":
                 word = tt("already checked in this round, next at ", "本轮已签到，下次 ") + reset[:16].replace("T", " ")
             gain = f" +${got:.2f}" if got else ""
             tail = (tt(", balance ", "，余额 ") + f"${bal:.2f}") if bal is not None else ""
             msg = f"{n}: {word}{gain}{tail}"
+            last_done = stamp if status == "done" else (rec.get(n) or {}).get("last_done")
             rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "balance": bal,
                       "status": "error" if status == "nobonus" else status, "awarded": got,
-                      "error": word if status == "nobonus" else None, "next_reset": reset}
+                      "error": word if status == "nobonus" else None, "next_reset": reset,
+                      "last_done": last_done}
             ok = ok and status != "nobonus"
         except Exception as e:
             ok = False
             msg = f"{n}: " + tt("check-in failed: ", "签到失败：") + str(e)
-            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": "error", "error": str(e)}
+            rec[n] = {"at": stamp, "date": datetime.now().strftime("%Y-%m-%d"), "status": "error", "error": str(e),
+                      "last_done": (rec.get(n) or {}).get("last_done")}
         print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
     for n in names:
         if done_today(n) and not force_all:
@@ -2646,6 +2989,8 @@ def agy_status_checkin():
     for n, r in sorted(rec.items()):
         if r.get("status") == "error":
             line = tt("failed: ", "失败 ") + (r.get("error") or "")
+        elif r.get("status") == "wait":
+            line = tt("no bonus due now, next run tries again", "暂无可领，下次运行再试")
         elif r.get("date") == today:
             line = tt("done today", "今天已签") + (f" +${r['awarded']:.2f}" if r.get("awarded") is not None else "")
         else:
@@ -2920,6 +3265,16 @@ def agy_site_balance(name, max_age=AGY_SITE_BALANCE_TTL):
     if cache.get("usd") is not None and now - cache.get("at", 0) < max_age:
         return cache["usd"], now - cache["at"], None
     site = _read_json(os.path.join(agy_sites_dir(), name + ".json"), {}) or {}
+    if site.get("mode") == "browser":
+        # Opening a browser for every status call is too heavy; show the balance read at the last check-in.
+        r = (st.get("checkin") or {}).get(name) or {}
+        if r.get("balance") is None:
+            return None, None, tt("read at the next check-in", "下次签到时读取")
+        try:
+            at = datetime.fromisoformat(r["at"]).timestamp()
+        except (KeyError, ValueError):
+            at = now
+        return r["balance"], now - at, None
     if site.get("mode") != "sub2api" and not site.get("access_token"):
         return None, None, tt("no access token saved", "没有保存访问令牌")
     try:
@@ -3113,6 +3468,9 @@ Usage:
                                     daily check-in now, or schedule it twice a day
   ccauth agy site <name> <url> <username> <user_id> [access_token]
                                     add a site whose daily bonus is granted on login
+  ccauth agy site <name> <url> --browser
+                                    add a NewAPI site behind a browser check: log in once in the Chrome
+                                    window that opens (LinuxDO works), check-ins then run headless
   ccauth agy writer <name> <model|off>
                                     steps the model marks as writing run on this model
   ccauth agy fallback <name> <other|off>
@@ -3148,6 +3506,9 @@ Restart agy and the desktop app after switching.""",
                                     立即签到，或设置每天定时自动签到
   ccauth agy site <名字> <地址> <用户名> <用户ID> [系统访问令牌]
                                     添加登录即签到的站点
+  ccauth agy site <名字> <地址> --browser
+                                    添加有浏览器校验的 NewAPI 站点，在弹出的 Chrome 窗口登录一次
+                                    （可用 LinuxDO），之后在后台无界面签到
   ccauth agy writer <名字> <模型|off>
                                     模型标记为写作的步骤改用这个模型
   ccauth agy fallback <名字> <备用名字|off>
@@ -3220,6 +3581,16 @@ def agy_main(argv):
         if len(rest) != 2:
             die("needs_arg", cmd="agy login <name> <username>")
         acmd_login(rest[0], rest[1])
+    elif cmd == "site" and "--browser" in rest:
+        args = [a for a in rest if a != "--browser"]
+        state = None
+        if "--from" in args:
+            i = args.index("--from")
+            state = args[i + 1] if i + 1 < len(args) else None
+            args = args[:i] + args[i + 2:]
+        if len(args) != 2 or ("--from" in rest and not state):
+            die("needs_arg", cmd="agy site <name> <url> --browser [--from storage-state.json]")
+        acmd_site_browser(args[0], args[1], state)
     elif cmd == "site":
         if len(rest) not in (3, 4, 5):
             die("needs_arg", cmd="agy site <name> <url> <username> [user_id] [access_token]")
